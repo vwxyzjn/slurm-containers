@@ -1,0 +1,308 @@
+From 401e7140b2508d68829b2442e9d73e545eab8356 Mon Sep 17 00:00:00 2001
+From: Costa Huang <costa@periodiclabs.ai>
+Date: Thu, 28 May 2026 00:11:58 -0700
+Subject: [PATCH] Pack configured QOS on contaminated nodes
+
+---
+ src/plugins/select/cons_tres/job_test.c       | 207 ++++++++++++++++++
+ .../select/cons_tres/select_cons_tres.c       |  25 +++
+ .../select/cons_tres/select_cons_tres.h       |   1 +
+ 3 files changed, 233 insertions(+)
+
+diff --git a/src/plugins/select/cons_tres/job_test.c b/src/plugins/select/cons_tres/job_test.c
+index cb2f02625a..62af55f62c 100644
+--- a/src/plugins/select/cons_tres/job_test.c
++++ b/src/plugins/select/cons_tres/job_test.c
+@@ -2930,6 +2930,205 @@ test_future:
+ 	return rc;
+ }
+ 
++static bool _is_packed_qos_job(job_record_t *job_ptr)
++{
++	if (!packed_qos || !job_ptr->qos_ptr || !job_ptr->qos_ptr->name)
++		return false;
++
++	return !xstrcasecmp(job_ptr->qos_ptr->name, packed_qos);
++}
++
++static bool _packed_qos_applies(job_record_t *job_ptr, uint32_t min_nodes,
++				uint32_t max_nodes, uint32_t req_nodes,
++				uint16_t job_node_req)
++{
++	job_details_t *details_ptr = job_ptr->details;
++
++	if (!details_ptr)
++		return false;
++	if (!_is_packed_qos_job(job_ptr))
++		return false;
++	if (job_ptr->het_job_id)
++		return false;
++	if ((job_node_req == NODE_CR_RESERVED) ||
++	    (details_ptr->whole_node & WHOLE_NODE_REQUIRED))
++		return false;
++	if ((min_nodes > 1) || (req_nodes > 1) || (max_nodes > 1))
++		return false;
++
++	return true;
++}
++
++static bool _node_has_non_preemptable_job(list_t *node_jobs,
++					  list_t *preemptee_candidates)
++{
++	job_record_t *tmp_job_ptr;
++	list_itr_t *job_iterator;
++
++	if (!node_jobs)
++		return false;
++
++	job_iterator = list_iterator_create(node_jobs);
++	while ((tmp_job_ptr = list_next(job_iterator))) {
++		if (!_is_preemptable(tmp_job_ptr, preemptee_candidates)) {
++			list_iterator_destroy(job_iterator);
++			return true;
++		}
++	}
++	list_iterator_destroy(job_iterator);
++
++	return false;
++}
++
++static bitstr_t *_packed_qos_contaminated_nodes(bitstr_t *node_bitmap,
++						node_use_record_t *node_usage,
++						list_t *preemptee_candidates)
++{
++	bitstr_t *contaminated_nodes;
++
++	if (!node_usage)
++		return NULL;
++
++	contaminated_nodes = bit_alloc(node_record_count);
++
++	for (int i = 0; next_node_bitmap(node_bitmap, &i); i++) {
++		if (_node_has_non_preemptable_job(node_usage[i].jobs,
++						  preemptee_candidates))
++			bit_set(contaminated_nodes, i);
++	}
++
++	if (!bit_set_count(contaminated_nodes))
++		FREE_NULL_BITMAP(contaminated_nodes);
++
++	return contaminated_nodes;
++}
++
++static int _packed_qos_build_preemptee_list(job_record_t *job_ptr,
++					    bitstr_t *node_bitmap,
++					    list_t *packed_preemptees,
++					    list_t **preemptee_job_list)
++{
++	job_record_t *tmp_job_ptr;
++	list_itr_t *preemptee_iterator;
++	bool remove_some_jobs = false;
++	bool created_list = false;
++
++	if (!preemptee_job_list || !packed_preemptees)
++		return SLURM_SUCCESS;
++
++	if (*preemptee_job_list == NULL) {
++		*preemptee_job_list = list_create(NULL);
++		created_list = true;
++	}
++
++	preemptee_iterator = list_iterator_create(packed_preemptees);
++	while ((tmp_job_ptr = list_next(preemptee_iterator))) {
++		if (!job_overlap_and_running(node_bitmap,
++					     job_ptr->licenses_to_preempt,
++					     tmp_job_ptr))
++			continue;
++		list_append(*preemptee_job_list, tmp_job_ptr);
++		remove_some_jobs = true;
++	}
++	list_iterator_destroy(preemptee_iterator);
++
++	if (!remove_some_jobs && created_list)
++		FREE_NULL_LIST(*preemptee_job_list);
++
++	return SLURM_SUCCESS;
++}
++
++static int _try_packed_qos(job_record_t *job_ptr, bitstr_t *node_bitmap,
++			   uint32_t min_nodes, uint32_t max_nodes,
++			   uint32_t req_nodes, uint16_t job_node_req,
++			   list_t *preemptee_candidates,
++			   list_t **preemptee_job_list,
++			   resv_exc_t *resv_exc_ptr, uint16_t tmp_cr_type)
++{
++	int rc = SLURM_ERROR;
++	bitstr_t *packed_nodes = NULL, *try_nodes = NULL;
++	job_record_t *tmp_job_ptr;
++	list_itr_t *job_iterator;
++	list_t *license_list = NULL, *packed_preemptees = NULL;
++	part_res_record_t *future_part = NULL;
++	node_use_record_t *future_usage = NULL;
++
++	if (!_packed_qos_applies(job_ptr, min_nodes, max_nodes, req_nodes,
++				 job_node_req))
++		return SLURM_ERROR;
++
++	packed_nodes = _packed_qos_contaminated_nodes(node_bitmap,
++						      select_node_usage,
++						      preemptee_candidates);
++	if (!packed_nodes)
++		return SLURM_ERROR;
++
++	try_nodes = bit_copy(packed_nodes);
++	license_list = cluster_license_copy();
++	rc = _job_test(job_ptr, try_nodes, min_nodes, max_nodes, req_nodes,
++		       SELECT_MODE_RUN_NOW, tmp_cr_type, job_node_req,
++		       select_part_record, select_node_usage, license_list,
++		       resv_exc_ptr, false, false, false, NULL);
++	FREE_NULL_LIST(license_list);
++	if (rc == SLURM_SUCCESS) {
++		bit_copybits(node_bitmap, try_nodes);
++		goto fini;
++	}
++
++	if (!preemptee_candidates)
++		goto fini;
++
++	license_list = cluster_license_copy();
++	future_part = part_data_dup_res(select_part_record, packed_nodes);
++	if (!future_part)
++		goto fini;
++
++	future_usage = node_data_dup_use(select_node_usage, packed_nodes);
++	if (!future_usage)
++		goto fini;
++
++	packed_preemptees = list_create(NULL);
++	job_iterator = list_iterator_create(preemptee_candidates);
++	while ((tmp_job_ptr = list_next(job_iterator))) {
++		uint16_t mode = slurm_job_preempt_mode(tmp_job_ptr);
++
++		if ((mode != PREEMPT_MODE_REQUEUE) &&
++		    (mode != PREEMPT_MODE_CANCEL))
++			continue;
++		if (_job_res_rm_job(future_part, future_usage, license_list,
++				    tmp_job_ptr, 0, packed_nodes))
++			continue;
++
++		list_append(packed_preemptees, tmp_job_ptr);
++		FREE_NULL_BITMAP(try_nodes);
++		try_nodes = bit_copy(packed_nodes);
++		rc = _job_test(job_ptr, try_nodes, min_nodes, max_nodes,
++			       req_nodes, SELECT_MODE_WILL_RUN, tmp_cr_type,
++			       job_node_req, future_part, future_usage,
++			       license_list, resv_exc_ptr, false, false,
++			       true, NULL);
++		if (rc != SLURM_SUCCESS)
++			continue;
++
++		bit_copybits(node_bitmap, try_nodes);
++		_packed_qos_build_preemptee_list(job_ptr, node_bitmap,
++						 packed_preemptees,
++						 preemptee_job_list);
++		break;
++	}
++	list_iterator_destroy(job_iterator);
++
++fini:
++	FREE_NULL_BITMAP(packed_nodes);
++	FREE_NULL_BITMAP(try_nodes);
++	FREE_NULL_LIST(license_list);
++	FREE_NULL_LIST(packed_preemptees);
++	part_data_destroy_res(future_part);
++	node_data_destroy(future_usage);
++
++	return rc;
++}
++
+ /* Allocate resources for a job now, if possible */
+ static int _run_now(job_record_t *job_ptr, bitstr_t *node_bitmap,
+ 		    uint32_t min_nodes, uint32_t max_nodes,
+@@ -2951,6 +3150,14 @@ static int _run_now(job_record_t *job_ptr, bitstr_t *node_bitmap,
+ 	bool preempt_mode = false;
+ 
+ 	save_node_map = bit_copy(node_bitmap);
++	rc = _try_packed_qos(job_ptr, node_bitmap, min_nodes, max_nodes,
++			     req_nodes, job_node_req, preemptee_candidates,
++			     preemptee_job_list, resv_exc_ptr, tmp_cr_type);
++	if (rc == SLURM_SUCCESS) {
++		FREE_NULL_BITMAP(save_node_map);
++		return rc;
++	}
++	bit_copybits(node_bitmap, save_node_map);
+ top:	orig_node_map = bit_copy(save_node_map);
+ 
+ 	license_list = cluster_license_copy();
+diff --git a/src/plugins/select/cons_tres/select_cons_tres.c b/src/plugins/select/cons_tres/select_cons_tres.c
+index cc13ee25dc..460aa21500 100644
+--- a/src/plugins/select/cons_tres/select_cons_tres.c
++++ b/src/plugins/select/cons_tres/select_cons_tres.c
+@@ -87,6 +87,7 @@ bitstr_t *idle_node_bitmap;
+ bool     backfill_busy_nodes  = false;
+ int      bf_window_scale      = 0;
+ bool     gang_mode            = false;
++char    *packed_qos           = NULL;
+ bool     preempt_by_part      = false;
+ bool     preempt_by_qos       = false;
+ bool     spec_cores_first     = false;
+@@ -199,6 +200,28 @@ extern int init(void)
+ 	return SLURM_SUCCESS;
+ }
+ 
++static void _parse_packed_qos(void)
++{
++	char *start, *end;
++
++	xfree(packed_qos);
++
++	if (!(start = xstrcasestr(slurm_conf.sched_params, "packed_qos=")))
++		return;
++
++	start += 11;
++	end = strpbrk(start, ", \t");
++	if (end)
++		packed_qos = xstrndup(start, end - start);
++	else
++		packed_qos = xstrdup(start);
++
++	if (!packed_qos[0])
++		xfree(packed_qos);
++	else
++		info("SchedulerParameters packed_qos=%s", packed_qos);
++}
++
+ extern int fini(void)
+ {
+ 	if (slurm_conf.debug_flags & DEBUG_FLAG_SELECT_TYPE)
+@@ -211,6 +234,7 @@ extern int fini(void)
+ 	part_data_destroy_res(select_part_record);
+ 	select_part_record = NULL;
+ 	cr_fini_global_core_data();
++	xfree(packed_qos);
+ 
+ 	return SLURM_SUCCESS;
+ }
+@@ -279,6 +303,7 @@ extern int select_p_node_init(void)
+ 		backfill_busy_nodes = true;
+ 	else
+ 		backfill_busy_nodes = false;
++	_parse_packed_qos();
+ 
+ 	preempt_type = slurm_get_preempt_type();
+ 	preempt_by_part = false;
+diff --git a/src/plugins/select/cons_tres/select_cons_tres.h b/src/plugins/select/cons_tres/select_cons_tres.h
+index 78adab636a..7dc6f0b0b4 100644
+--- a/src/plugins/select/cons_tres/select_cons_tres.h
++++ b/src/plugins/select/cons_tres/select_cons_tres.h
+@@ -74,6 +74,7 @@ extern int      bf_window_scale;
+ extern bool     gang_mode;
+ extern bool     have_dragonfly;
+ extern bool     pack_serial_at_end;
++extern char    *packed_qos;
+ extern bool     preempt_by_part;
+ extern bool     preempt_by_qos;
+ extern bool     spec_cores_first;
+-- 
+2.39.5 (Apple Git-154)
+

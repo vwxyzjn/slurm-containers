@@ -26,6 +26,10 @@ licenses.
   - [0016-scontrol-dashboards](#0016-scontrol-dashboards)
   - [0019-empty-pids-retry](#0019-empty-pids-retry)
   - [0020-empty-topology](#0020-empty-topology)
+  - [0021-revert-remove-cg-limits.patch](#0021-revert-remove-cg-limitspatch)
+  - [0022-move-persist-conn-shutdown.patch](#0022-move-persist-conn-shutdownpatch)
+  - [0024-hetjob-sticky-preempt.patch](#0024-hetjob-sticky-preemptpatch)
+  - [0025-packed-qos-placement.patch](#0025-packed-qos-placementpatch)
 
 ### 0001-max-server-threads
 
@@ -198,3 +202,47 @@ to only run when we are not shutting down.
 Notes from `pthead_detch` man
 >       Once a thread has been detached, it can't be joined with
 >       pthread_join(3) or be made joinable again.
+
+### 0024-hetjob-sticky-preempt.patch
+
+This patch makes backfill keep a heterogeneous job's first component sticky
+while later components wait for already-triggered preemptions to drain. Without
+this patch, Slurm can start preempting victims for the first hetjob component,
+fail to immediately place a later component while its victims are still
+requeueing or completing, kill the first component, and then replan against a
+different node set.
+
+The timeout is configured by
+`SchedulerParameters=bf_hetjob_sticky_preempt_timeout=<seconds>` and defaults to
+1800 seconds in this image.
+
+### 0025-packed-qos-placement.patch
+
+This patch adds a `select/cons_tres` placement mode for a configured QOS:
+
+```text
+SchedulerParameters=packed_qos=packed_normal
+```
+
+For matching single-node, non-exclusive jobs, Slurm first tries nodes that are
+already "contaminated" by a non-preemptible job from the new job's perspective.
+If those nodes are only blocked by preemptible filler, Slurm simulates
+`REQUEUE` or `CANCEL` preemption on those contaminated nodes before it falls
+back to the existing placement path.
+
+This makes `packed_normal` jobs prefer filling partially occupied H200 or Turin
+nodes instead of spreading onto clean nodes. Preemptible jobs may still backfill
+holes, but they should not pin those holes if a later `packed_normal` job can
+fit after preempting them.
+
+The patch is intentionally narrow:
+
+- It is inert unless `packed_qos=<qos-name>` is configured.
+- It only changes `SELECT_MODE_RUN_NOW`; other scheduler tests keep existing
+  behavior.
+- It only applies to single-node, non-exclusive, non-hetjob allocations.
+- It still falls back to Slurm's existing placement and preemption code when the
+  packed path cannot place the job.
+
+For the desired production behavior, the configured QOS must also be allowed to
+preempt the filler QOS, for example `packed_normal` preempting `preemptible`.
