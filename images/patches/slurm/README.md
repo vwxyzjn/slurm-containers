@@ -30,6 +30,7 @@ licenses.
   - [0022-move-persist-conn-shutdown.patch](#0022-move-persist-conn-shutdownpatch)
   - [0024-hetjob-sticky-preempt.patch](#0024-hetjob-sticky-preemptpatch)
   - [0025-hetjob-pinned-plan.patch](#0025-hetjob-pinned-planpatch)
+  - [0026-hetjob-planned-preemptions.patch](#0026-hetjob-planned-preemptionspatch)
 
 ### 0001-max-server-threads
 
@@ -231,3 +232,16 @@ nodes, this forces `select/cons_tres` to validate and allocate the committed
 backfill plan instead of doing a broad fresh search. If the planned nodes are no
 longer available, the scheduler fails the committed attempt and rolls back rather
 than preempting an unrelated replacement set.
+
+### 0026-hetjob-planned-preemptions.patch
+
+This patch stores the QOS-preemptible victim job IDs that overlap each planned
+hetjob component bitmap. It covers the case where backfill has a concrete
+`SchedNodeList`, but the runtime `RUN_NOW` selection path returns
+`ESLURM_NODES_BUSY` before producing an actionable `preemptee_job_list`.
+
+When that happens on a pinned hetjob start, the scheduler now preempts the
+stored victims on the pinned bitmap and enters the existing sticky wait path.
+This makes the planned node bitmap and the victim list part of the same commit
+attempt, instead of repeatedly forecasting a workable plan without starting
+preemption.
