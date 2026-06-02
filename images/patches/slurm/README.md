@@ -26,6 +26,11 @@ licenses.
   - [0016-scontrol-dashboards](#0016-scontrol-dashboards)
   - [0019-empty-pids-retry](#0019-empty-pids-retry)
   - [0020-empty-topology](#0020-empty-topology)
+  - [0021-revert-remove-cg-limits.patch](#0021-revert-remove-cg-limitspatch)
+  - [0022-move-persist-conn-shutdown.patch](#0022-move-persist-conn-shutdownpatch)
+  - [0024-hetjob-sticky-preempt.patch](#0024-hetjob-sticky-preemptpatch)
+  - [0025-hetjob-pinned-plan.patch](#0025-hetjob-pinned-planpatch)
+  - [0026-hetjob-planned-preemptions.patch](#0026-hetjob-planned-preemptionspatch)
 
 ### 0001-max-server-threads
 
@@ -198,3 +203,45 @@ to only run when we are not shutting down.
 Notes from `pthead_detch` man
 >       Once a thread has been detached, it can't be joined with
 >       pthread_join(3) or be made joinable again.
+
+### 0024-hetjob-sticky-preempt.patch
+
+This patch keeps a heterogeneous job start attempt sticky after preemption has begun.
+Without it, backfill can start one hetjob component, fail a later component while
+preempted jobs are still completing, roll back the already-started component, and
+then replan against a different target set. The patch adds
+`bf_hetjob_sticky_preempt_timeout`, defaulting to 30 minutes, so the scheduler can
+wait for preempted jobs to finish cleanup before rolling back.
+
+This is a local workaround for a production scheduling issue. It may be replaceable
+with an upstream fix if Slurm gains commit-style hetjob preemption semantics.
+
+### 0025-hetjob-pinned-plan.patch
+
+This patch pins hetjob immediate starts to the exact node bitmap selected by
+backfill. The unpatched path records `SchedNodeList` for display and reservation
+state, but `_het_job_start_now()` rebuilds a broad availability bitmap before
+calling `_start_job()`. On fragmented partitions that fresh search can fail to
+reconstruct the same concrete preemption plan and return `Requested nodes are busy`
+even when the displayed `SchedNodeList` is all preemptible.
+
+The patch stores the selected backfill bitmap on each het component record and
+intersects the immediate-start availability bitmap with that plan before calling
+`_start_job()`. Since `_start_job()` already treats its bitmap argument as excluded
+nodes, this forces `select/cons_tres` to validate and allocate the committed
+backfill plan instead of doing a broad fresh search. If the planned nodes are no
+longer available, the scheduler fails the committed attempt and rolls back rather
+than preempting an unrelated replacement set.
+
+### 0026-hetjob-planned-preemptions.patch
+
+This patch stores the QOS-preemptible victim job IDs that overlap each planned
+hetjob component bitmap. It covers the case where backfill has a concrete
+`SchedNodeList`, but the runtime `RUN_NOW` selection path returns
+`ESLURM_NODES_BUSY` before producing an actionable `preemptee_job_list`.
+
+When that happens on a pinned hetjob start, the scheduler now preempts the
+stored victims on the pinned bitmap and enters the existing sticky wait path.
+This makes the planned node bitmap and the victim list part of the same commit
+attempt, instead of repeatedly forecasting a workable plan without starting
+preemption.
