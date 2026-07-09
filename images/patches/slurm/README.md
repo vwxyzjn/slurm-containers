@@ -252,3 +252,20 @@ stored victims on the pinned bitmap and enters the existing sticky wait path.
 This makes the planned node bitmap and the victim list part of the same commit
 attempt, instead of repeatedly forecasting a workable plan without starting
 preemption.
+
+### 0027-hetjob-launch-transaction-clean.patch
+
+This patch replaces the incremental heterogeneous-job launch behavior with a
+single backfill launch transaction. After normal eligibility checks, it commits
+the exact node, victim, partition, QOS, and reservation plan; hides those nodes
+from competing schedules; and retries that exact plan while preempted jobs
+finish. The default `bf_hetjob_commit_timeout` is 30 minutes.
+
+### 0028-job-launch-transaction-clean.patch
+
+This patch extends launch transactions to ordinary jobs. It pins the selected
+nodes and planned victims, prevents main-scheduler rerouting, and retries the
+committed plan while preemptions clear. Ordinary and heterogeneous transactions
+also reject overlapping commits, so the first validated transaction owns the
+nodes until it starts, fails validation, or reaches its timeout. The default
+`bf_job_commit_timeout` is 30 minutes.
