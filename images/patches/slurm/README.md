@@ -269,3 +269,17 @@ committed plan while preemptions clear. Ordinary and heterogeneous transactions
 also reject overlapping commits, so the first validated transaction owns the
 nodes until it starts, fails validation, or reaches its timeout. The default
 `bf_job_commit_timeout` is 30 minutes.
+
+### 0029-hetjob-launch-all-components.patch
+
+This patch makes a committed heterogeneous-job launch plan immutable, starts
+planned preemptions for every pending component before attempting to launch any
+component, and waits until all planned victims have released their resources.
+It also treats an already-active component preemption as transaction progress
+rather than a hard start failure. Once any component starts, the transaction is
+irrevocable: started components remain running, remaining planned nodes stay
+pinned, and retries continue past the normal transaction timeout until every
+component starts or the job is explicitly cancelled. Launched components are
+latched per transaction, so a component finishing does not make the scheduler
+forget the partial launch. Cancellation or another terminal state releases the
+remaining pins without deallocating components that already launched.
