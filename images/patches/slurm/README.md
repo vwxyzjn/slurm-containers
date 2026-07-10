@@ -32,6 +32,10 @@ licenses.
   - [0024-hetjob-sticky-preempt.patch](#0024-hetjob-sticky-preemptpatch)
   - [0025-hetjob-pinned-plan.patch](#0025-hetjob-pinned-planpatch)
   - [0026-hetjob-planned-preemptions.patch](#0026-hetjob-planned-preemptionspatch)
+  - [0027-hetjob-launch-transaction-clean.patch](#0027-hetjob-launch-transaction-cleanpatch)
+  - [0028-job-launch-transaction-clean.patch](#0028-job-launch-transaction-cleanpatch)
+  - [0029-hetjob-launch-all-components.patch](#0029-hetjob-launch-all-componentspatch)
+  - [0030-job-launch-preempt-before-start.patch](#0030-job-launch-preempt-before-startpatch)
 
 ### 0001-max-server-threads
 
@@ -283,3 +287,20 @@ component starts or the job is explicitly cancelled. Launched components are
 latched per transaction, so a component finishing does not make the scheduler
 forget the partial launch. Cancellation or another terminal state releases the
 remaining pins without deallocating components that already launched.
+
+### 0030-job-launch-preempt-before-start.patch
+
+This patch fixes a false wait in ordinary-job launch transactions. `_start_job()`
+can mark the target job as having preemption in progress and still return
+`ESLURM_NODES_BUSY` without preempting the transaction's planned victims. The
+old code treated that target-side state as sufficient proof of progress, and C
+short-circuit evaluation prevented the planned-victim helper from running. The
+transaction could therefore report that it was waiting for planned preemptions
+even though every victim remained running with no `PreemptTime`.
+
+Ordinary launch transactions now initiate their exact planned victims before
+attempting allocation. They retry any planned victim that is still running
+without a `PreemptTime`, wait while those jobs are running or completing on the
+pinned nodes, and only report a preemption wait while the helper still finds an
+exact planned victim occupying those nodes. A stale target-side
+`preempt_start_time` can no longer keep a no-op transaction alive.
