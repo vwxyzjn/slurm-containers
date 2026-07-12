@@ -326,3 +326,9 @@ The scheduler only updates or clears `SystemComment` values that begin with its
 own `LaunchTxn:` prefix, preserving unrelated administrator comments. It clears
 owned comments when a transaction ends and removes stale owned status when the
 backfill scheduler starts after a controller restart.
+
+Categorical launch reasons are cleared independently of `SystemComment`
+ownership, so preserving an administrator comment cannot leave a stale
+`Preempting` reason. Heterogeneous-job status aggregation ignores components
+that already launched, and an irrevocable partial launch keeps its current hold
+or retry detail in the `LaunchTxn:` comment.
