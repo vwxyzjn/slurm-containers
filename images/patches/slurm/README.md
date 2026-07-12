@@ -36,6 +36,7 @@ licenses.
   - [0028-job-launch-transaction-clean.patch](#0028-job-launch-transaction-cleanpatch)
   - [0029-hetjob-launch-all-components.patch](#0029-hetjob-launch-all-componentspatch)
   - [0030-job-launch-preempt-before-start.patch](#0030-job-launch-preempt-before-startpatch)
+  - [0031-launch-transaction-status.patch](#0031-launch-transaction-statuspatch)
 
 ### 0001-max-server-threads
 
@@ -304,3 +305,24 @@ without a `PreemptTime`, wait while those jobs are running or completing on the
 pinned nodes, and only report a preemption wait while the helper still finds an
 exact planned victim occupying those nodes. A stale target-side
 `preempt_start_time` can no longer keep a no-op transaction alive.
+
+### 0031-launch-transaction-status.patch
+
+This patch separates the short operator-facing reason for a committed launch
+transaction from its detailed timing. Pending ordinary and heterogeneous jobs
+now use categorical reasons such as `PreemptionPlanned`, `Preempting`, and
+`HetjobPartialLaunch`, so `squeue` no longer presents the 30-minute transaction
+safety timeout as though it were the expected preemption wait.
+
+Detailed progress is written to the job's `SystemComment`, which is displayed by
+`scontrol show job`. The namespaced `LaunchTxn:` comment reports the number of
+blocking planned victims, the remaining grace time and effective total grace
+derived from those victims' `PreemptTime` and `EndTime`, a cleanup phase after
+grace expires, and the transaction's absolute safety deadline. For an
+irrevocable partial heterogeneous-job launch it instead states that no automatic
+timeout applies.
+
+The scheduler only updates or clears `SystemComment` values that begin with its
+own `LaunchTxn:` prefix, preserving unrelated administrator comments. It clears
+owned comments when a transaction ends and removes stale owned status when the
+backfill scheduler starts after a controller restart.
