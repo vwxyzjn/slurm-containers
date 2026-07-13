@@ -441,10 +441,30 @@ copies of the job's GRES request state so a GPU selection cannot leak into the
 pending job record.
 
 The patch also prevents two schedulers from initiating independent plans for
-the same ordinary job. While `bf_job_commit_timeout` is enabled, submit-time
-and main-scheduler allocation may still start a job on immediately free
-resources, but they return nodes busy instead of signaling preemptees. Backfill
-then selects, registers, and signals the single committed plan. Setting
-`bf_job_commit_timeout=0` restores the legacy non-transactional preemption path.
-QOS `GraceTime` remains authoritative after the transaction signals its
-selected victims.
+the same ordinary job. When submit-time or main-scheduler allocation finds that
+a job needs preemption, it records a per-job handoff and returns nodes busy
+without signaling preemptees. Backfill promotes handoff jobs ahead of its
+normal scan limits and evaluates them for immediate launch even when ordinary
+per-user or license scan filters would have skipped them. Backfill then
+selects, registers, and signals the single committed plan.
+
+A handoff grants one prompt backfill attempt rather than creating an unbounded
+retry loop. Backfill drops it if the owner has no queue record, is held, or is
+no longer pending. Once a promoted record passes cycle-wide budget and yield
+checks, either a job-specific eligibility rejection or a selection that does
+not open a transaction moves the marker into a non-active 120-second cooldown.
+Submit-time and main scheduling still cannot signal a competing victim set,
+but the marker does not force one-second backfill cycles. Records deferred by
+cycle-wide limits retain their active handoff until they receive that first
+job-specific consideration, and handoffs created while backfill temporarily
+yields survive until the next queue scan.
+
+The handoff is enabled directly from the live scheduler configuration only
+while ordinary launch transactions and `sched/backfill` are enabled. A failed
+run-now victim simulation is returned separately from an empty victim list, so
+neither ordinary jobs nor hetjob components can fall through to an uncommitted
+start attempt; its handoff enters cooldown after that backfill attempt, and a
+fresh active handoff cannot be created until the cooldown marker expires.
+Setting `bf_job_commit_timeout=0` restores the legacy
+non-transactional preemption path. QOS `GraceTime` remains authoritative after
+the transaction signals its selected victims.

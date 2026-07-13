@@ -183,11 +183,32 @@ first when an emergency reservation must claim those exact nodes.
 ## Minimal Victims and Scheduler Handoff
 
 Patch `0035-launch-transaction-minimal-victims.patch` makes backfill the only preemption initiator
-for ordinary jobs while ordinary launch transactions are enabled. Submit-time and main-scheduler
-allocation still start jobs that fit on immediately free resources. If starting would require
-preemption, they return `ESLURM_NODES_BUSY` without signaling a victim and leave the job for
-backfill. The job may therefore show `Reason=Resources` briefly before the next backfill pass opens
-its transaction.
+for an ordinary job while its launch handoff or transaction is active. Submit-time and
+main-scheduler allocation still start jobs that fit on immediately free resources. If starting
+would require preemption, the common selection path records a per-job handoff, returns
+`ESLURM_NODES_BUSY`, and does not signal a victim. Backfill promotes handoff queue records before
+ordinary records and evaluates those jobs for immediate launch even after normal
+`bf_max_job_test`, per-user/per-partition, or `bf_licenses` scan filters would have skipped them.
+The handoff forces a prompt backfill cycle only until its promoted queue record is attempted. The
+job may therefore show `Reason=Resources` until backfill opens its transaction.
+
+This is not a cluster-wide suppression flag. Jobs without a handoff continue through normal
+submit-time and main scheduling, and configuration is read synchronously from the live
+`SchedulerType`, `bf_interval`, and `bf_job_commit_timeout` values. Disabling ordinary transactions
+or backfill immediately stops creating handoffs; existing markers are cleared on the next
+selection or backfill maintenance pass. Terminal jobs and successful starts are pruned, and
+opening a transaction consumes its handoff atomically with registering node ownership. A handoff
+is also released when its owner has no freshly built backfill queue record, is held or no longer
+pending. If its promoted queue record reaches a real selection test but the cycle ends without a
+commit, the marker becomes non-active for a 120-second cooldown. The same transition occurs when
+the promoted record passes cycle-wide budget and yield checks but a job-specific eligibility test,
+such as a changed accounting limit or dependency, rejects it before selection. A record deferred
+by a cycle-wide timeout, RPC-pressure yield, or backfill budget retains its active handoff until a
+later cycle can actually consider the job. During cooldown, submit-time and main scheduling still
+defer preemption, but the marker neither receives promotion nor forces one-second backfill cycles;
+normal-cadence backfill may still start the job or open its transaction. After the cooldown
+expires, normal scheduling may create a fresh active handoff. Handoffs created while backfill
+yields are generation-stamped and survive until the next complete queue scan.
 
 For the already-selected pinned bitmap, backfill now calls the normal `SELECT_MODE_RUN_NOW`
 preemption simulator rather than `SELECT_MODE_WILL_RUN`. It detaches the pending job's existing
@@ -196,6 +217,11 @@ frees the simulated allocation and GRES state afterward, so planning cannot allo
 pending job. The returned victim IDs are the sufficient prefix chosen by Slurm's normal run-now
 preemption ordering. Backfill commits node ownership and those IDs before it calls
 `slurm_job_preempt()`, after which the victims' configured QOS `GraceTime` remains authoritative.
+The simulator also returns its status separately from the victim list. Any simulation error stops
+that attempt; it cannot be mistaken for a successful plan with no victims and cannot fall through
+to `_start_job()` outside a transaction. At cycle end, an unsuccessful prompt attempt enters the
+non-active cooldown rather than creating an unbounded
+one-second retry loop or immediately allowing another scheduler to signal victims.
 
 Victims remain indivisible jobs. A four-CPU request can preempt one six-CPU job, and one selected
 multi-node victim can release nodes outside the pinned bitmap. The patch prevents selecting every
@@ -205,8 +231,8 @@ or redefine Slurm's preemption ordering policy.
 ## Mitigation Levers
 
 `SchedulerParameters=bf_job_commit_timeout=0` plus `scontrol reconfigure` disables new ordinary
-launch transactions, restores submit-time and main-scheduler preemption, and drains open ones on
-the next backfill cycle. Setting
+launch handoffs and transactions, restores submit-time and main-scheduler preemption, clears
+uncommitted handoff markers, and drains open transactions on the next backfill cycle. Setting
 `bf_hetjob_commit_timeout=0` prevents new hetjob commits; a not-yet-started committed transaction
 finishes safe victim cleanup before returning to ordinary planning. An already partially launched
 hetjob remains irrevocable and must be cancelled explicitly. Rolling back the controller image to
@@ -247,8 +273,10 @@ against a higher-priority main-scheduler decision.
 
 The combined patch stack is intended to maintain these invariants:
 
-1. With ordinary launch transactions enabled, submit-time and main scheduling never initiate a
-   competing preemption plan; backfill owns victim selection and signaling.
+1. With ordinary launch transactions enabled, a submit-time or main-scheduler selection that needs
+   preemption creates one per-job handoff and never initiates a competing victim plan; backfill
+   promotes the handoff and owns victim selection and signaling. Each handoff grants one prompt
+   backfill attempt and becomes a non-active cooldown marker if that attempt cannot commit.
 2. A transaction stores one immutable node, victim, partition, QOS, and reservation plan.
 3. The planned victim list is the sufficient prefix selected by Slurm's run-now preemption
    algorithm for the exact pinned bitmap, not every preemptible job resident on those nodes.
@@ -285,7 +313,7 @@ preempt only one allocation of a multi-node victim job.
 ## Expected Operator Signals
 
 - `Reason=Resources` immediately after submission: no victim has been signaled yet; the job is
-  waiting for backfill to select and commit one transaction plan.
+  waiting for backfill to consume its handoff and commit one transaction plan.
 - `Reason=PreemptionPlanned`: the concrete transaction exists, but at least one planned victim has
   not yet received preemption.
 - `Reason=Preempting`: grace, victim exit, or pinned-node cleanup is in progress.
@@ -309,6 +337,13 @@ Before production rollout, exercise at least these cases and inspect controller 
 | Ordinary job, no preemption | Starts normally; no lingering ownership |
 | Four-CPU ordinary job on a full 192-CPU shared node with 32 six-CPU preemptible jobs | Exactly one sufficient six-CPU victim is selected and signaled; the other 31 continue running |
 | Submit-time and main scheduling evaluate a job before backfill commits | No victim receives `PreemptTime`; backfill later opens and signals one plan without a disjoint preliminary victim set |
+| Handoff job lies beyond `bf_max_job_test` or a configured per-user/per-partition backfill scan limit | Its queue record is promoted and receives an immediate transaction evaluation without creating a future reservation |
+| Handoff job needs license preemption while `bf_licenses` is unset | Backfill performs the immediate run-now transaction test; it either commits a sufficient victim plan or leaves the job pending without signaling anyone |
+| Handoff owner is held, cancelled, or absent from the next built backfill queue | Handoff releases without forcing repeated one-second backfill cycles |
+| Handoff is created while backfill has yielded its locks | The new marker survives the current cycle cleanup and receives one attempt from the next complete queue scan |
+| Handoff owner becomes ineligible because an accounting limit or dependency changes | Once its promoted record is considered, the handoff enters non-active cooldown without signaling victims or forcing repeated one-second cycles |
+| Cycle budget, RPC pressure, or a state-changing yield interrupts before a promoted handoff receives job-specific consideration | Active handoff survives and is promoted again; it is not discarded before its first consideration |
+| Pinned run-now victim simulation returns an error | No transaction is created, neither `_start_job()` nor any victim signal occurs for that attempt, and the handoff enters non-active cooldown instead of hot-looping or being immediately recreated |
 | Ordinary job, five-minute grace | Victims receive preemption once; owner starts on the pinned nodes after grace and cleanup |
 | Later higher-priority job arrives during cleanup | Later job cannot acquire committed nodes; it uses other capacity or remains pending |
 | Ordinary transaction exceeds safety timeout after signaling victims | No new victims are selected; original victims drain, ownership releases, and the bounded replan cooldown begins |
