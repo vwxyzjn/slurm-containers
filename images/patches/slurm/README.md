@@ -39,6 +39,7 @@ licenses.
   - [0031-launch-transaction-status.patch](#0031-launch-transaction-statuspatch)
   - [0032-launch-transaction-node-ownership.patch](#0032-launch-transaction-node-ownershippatch)
   - [0033-launch-transaction-reliability.patch](#0033-launch-transaction-reliabilitypatch)
+  - [0034-launch-transaction-bounded-replan.patch](#0034-launch-transaction-bounded-replanpatch)
 
 ### 0001-max-server-threads
 
@@ -382,3 +383,39 @@ teardown destroys the hetjob transaction list while the job write lock is
 still held, since its destructor mutates job records. Transaction lifecycle
 events now log at `info` level: opens with pinned-node and planned-victim or
 component counts, releases/invalidations/timeouts with the reason.
+
+### 0034-launch-transaction-bounded-replan.patch
+
+This patch prevents a failed committed plan from immediately selecting and
+preempting a replacement victim set. Once any planned victim has entered
+preemption, an invalid or timed-out ordinary or not-yet-started heterogeneous
+transaction first enters a cleanup state. It keeps the original node fence,
+waits without sending any new preemption requests, and releases the fence only
+after the original victims have left. The owner then waits a configurable
+cooldown before one bounded replacement plan is allowed. A second failed
+victim plan is blocked for operator review instead of creating an unbounded
+preemption storm. Defaults are
+`SchedulerParameters=bf_launch_replan_delay=300,bf_launch_max_replans=1`.
+
+Non-`ESLURM_NODES_BUSY` start errors no longer discard a valid committed plan
+mid-grace. The scheduler retains the exact nodes and victims and retries that
+same start every five seconds until it succeeds, validation fails, or the
+existing commit safety timeout expires. This does not change QOS preemption
+semantics: `slurm_job_preempt()` remains authoritative, so a configured
+five-minute `GraceTime` is neither hardcoded nor shortened by this patch.
+
+Before a heterogeneous launch allocates its first component, every remaining
+component must pass an exact `SELECT_MODE_RUN_NOW` check on its pinned bitmap
+with no replacement preemptee candidates. This closes the common resource and
+GRES race where one component started while another was already unable to
+allocate. Components are still launched sequentially after the barrier, so a
+hardware failure in that final interval remains possible. If any component has
+already started, the launch stays irrevocable and visible; Slurm never rolls
+back the running component automatically.
+
+Finally, reservation creation, resource-changing reservation updates, and
+automatic reservation node selection now exclude nodes owned by active launch
+transactions, including `MAINT` and `OVERLAP` placement. The short-lived launch
+commit wins; an operator can cancel the owner before placing an emergency
+reservation on those exact nodes. Retry and block state is controller-local
+and is cleared with stale transaction status when the backfill agent restarts.
