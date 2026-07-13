@@ -37,6 +37,7 @@ licenses.
   - [0029-hetjob-launch-all-components.patch](#0029-hetjob-launch-all-componentspatch)
   - [0030-job-launch-preempt-before-start.patch](#0030-job-launch-preempt-before-startpatch)
   - [0031-launch-transaction-status.patch](#0031-launch-transaction-statuspatch)
+  - [0032-launch-transaction-node-ownership.patch](#0032-launch-transaction-node-ownershippatch)
 
 ### 0001-max-server-threads
 
@@ -332,3 +333,19 @@ ownership, so preserving an administrator comment cannot leave a stale
 `Preempting` reason. Heterogeneous-job status aggregation ignores components
 that already launched, and an irrevocable partial launch keeps its current hold
 or retry detail in the `LaunchTxn:` comment.
+
+### 0032-launch-transaction-node-ownership.patch
+
+This patch closes the race between planned-victim teardown and allocation of
+the intended pinned job. A transaction can reach a point where no tracked victim
+still overlaps its nodes while `select/cons_tres` or GRES cleanup continues to
+return `ESLURM_NODES_BUSY`. Retrying alone is insufficient because the main
+scheduler can allocate those freshly released nodes to another job first.
+
+Committed ordinary and heterogeneous launch transactions now register their
+exact nodes in a controller-wide ownership registry. The common run-now
+selection path hides those nodes from every non-owner while allowing the owner
+to retry its immutable plan. Ownership follows the existing transaction
+lifecycle and partial hetjob launches remain irrevocable. See
+[`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md) for the production incident,
+design alternatives, invariants, limitations, and regression matrix.

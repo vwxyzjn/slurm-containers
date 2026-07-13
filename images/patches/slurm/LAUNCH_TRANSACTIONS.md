@@ -1,0 +1,162 @@
+# Launch Transaction Design
+
+## Objective
+
+Preemption must have commit semantics for both ordinary and heterogeneous jobs:
+
+1. Backfill selects one concrete node and victim plan.
+2. Slurm commits that plan before initiating any victim preemption.
+3. QOS grace time is honored normally.
+4. The intended job retries the same nodes while victims exit and node/GRES cleanup finishes.
+5. Other jobs cannot acquire committed nodes between victim cleanup and launch.
+6. The transaction ends only after launch, explicit invalidation, cancellation, or its safety timeout.
+
+The important property is not merely that enough aggregate capacity exists. Once Slurm preempts
+jobs for a concrete plan, the resulting capacity must remain owned by that transaction until the
+intended launch has had a reliable opportunity to consume it.
+
+## 2026-07-13 Incident
+
+Ordinary job `2131756` committed a 24-node GPU plan with 87 blocking jobs. Slurm initiated the
+planned preemptions and honored their configured grace periods. The launch then encountered this
+sequence:
+
+- At `14:24:45`, `_start_job()` returned `ESLURM_NODES_BUSY` for the exact pinned plan.
+- The planned victim records no longer appeared to overlap the nodes, so the backfill plugin
+  released the launch transaction and allowed replanning.
+- At `14:24:50`, later job `2131761` acquired eight of the nodes released for `2131756`.
+- Job `2131756` remained pending with `Reason=Resources` and a different `SchedNodeList`.
+
+This means jobs were preempted for `2131756`, but that launch attempt did not receive the capacity
+it created. The job did not enter a terminal failed state; it returned to normal pending/replanning.
+That distinction does not make the behavior safe: repeated replanning can preempt another victim
+set and create a preemption storm without making forward progress.
+
+## Root Cause
+
+There are two independent races.
+
+### Victim teardown gap
+
+A victim can stop appearing as a running or completing job on the pinned bitmap before
+`select/cons_tres`, GRES, or node accounting is ready to allocate those nodes. During this gap,
+`_start_job()` correctly reports `ESLURM_NODES_BUSY`, but a victim-record-only progress check can
+incorrectly conclude that the transaction has nothing left to wait for.
+
+Patch `0030-job-launch-preempt-before-start.patch` intentionally stopped trusting the target job's
+stale `preempt_in_progress` and `preempt_start_time` flags. Restoring those flags as the wait
+condition would reintroduce the earlier no-op transaction that waited without initiating the
+planned victims.
+
+### Main-scheduler ownership gap
+
+The backfill plugin's transaction bitmaps prevent competing backfill plans from overlapping, and
+`bf_launch_transaction` prevents the main scheduler from rerouting the transaction owner. Neither
+mechanism prevents the main scheduler from allocating freshly released transaction nodes to a
+different job. Retrying the pinned launch is therefore necessary but insufficient.
+
+## Selected Fix
+
+Patch `0032-launch-transaction-node-ownership.patch` adds controller-wide, in-memory ownership for
+committed launch-transaction nodes.
+
+- An ordinary transaction registers its exact node bitmap under the job ID.
+- A heterogeneous transaction registers the union of every component bitmap under the hetjob ID.
+- The common run-now node-selection path removes transaction-owned nodes for every non-owner job.
+- The owning ordinary job, or any component of the owning hetjob, remains eligible to allocate its
+  exact pinned nodes.
+- `ESLURM_NODES_BUSY` remains retryable after victim records disappear, covering node and GRES
+  cleanup latency without changing plans.
+- Ownership is released with the existing transaction lifecycle: successful launch, validation
+  failure, cancellation or terminal state, plugin teardown, or the configured safety timeout.
+- Once any hetjob component starts, the transaction remains irrevocable and has no automatic
+  timeout. Started components are never rolled back merely because another component is waiting.
+
+The registry is protected independently from scheduler thread lifecycle, but it does not persist
+across a `slurmctld` restart. Launch transactions themselves are also in-memory state; after a
+restart, normal scheduling and stale-status cleanup resume without reconstructing an old commit.
+
+## Alternatives Considered
+
+### Trust target preemption flags
+
+Rejected. Those flags can be set even when no planned victim was preempted. They caused the stuck
+ordinary-job behavior fixed by patch 0030.
+
+### Retry only while nodes are busy
+
+Rejected as incomplete. It closes the victim teardown gap, but a different main-scheduler job can
+still acquire a released node before the next backfill retry.
+
+### Raise the owner's priority
+
+Rejected. Priority is policy, not ownership. A temporary priority mutation would be difficult to
+restore correctly, would affect unrelated scheduling decisions, and still would not make a
+multi-component hetjob launch atomic.
+
+### Create synthetic Slurm reservations
+
+Rejected for now. Reservations are persisted and policy-visible objects with accounting,
+validation, and lifecycle semantics much broader than this short-lived internal commit. Using them
+would make the patch substantially more invasive.
+
+### Mark nodes with `NODE_STATE_PLANNED`
+
+Rejected. That state represents normal backfill planning and is not an exclusive allocation guard
+against a higher-priority main-scheduler decision.
+
+## Invariants
+
+The combined patch stack is intended to maintain these invariants:
+
+1. A transaction stores one immutable node, victim, partition, QOS, and reservation plan.
+2. All planned hetjob component preemptions begin before any component launch is attempted.
+3. Only planned victims are initiated by the transaction; it never substitutes a new victim set.
+4. Committed nodes are unavailable to every non-owner run-now selection.
+5. `ESLURM_NODES_BUSY` retries the exact plan instead of releasing it merely because victim job
+   records have disappeared.
+6. Ordinary jobs and not-yet-started hetjobs retain the configured 30-minute safety timeout.
+7. A partial hetjob launch is irrevocable and continues retrying remaining components without an
+   automatic timeout or rollback.
+8. Validation failures and terminal job state release ownership rather than leaving stale capacity
+   hidden from the scheduler.
+9. QOS grace time remains authoritative; node ownership does not shorten or bypass it.
+
+These guarantees do not make launch unconditional. A node can fail, be drained, lose required
+features, or become invalid for a reservation. Such a real validation failure releases an ordinary
+transaction for safe replanning. The guarantee is narrower and essential: another scheduler path
+cannot steal a still-valid transaction's committed nodes.
+
+Preemption is job-level. If one planned victim spans nodes outside the intended node bitmap,
+preempting that victim can release more physical nodes than the new job requests. The transaction
+does not add replacement victims or broaden its selected node bitmap, but it cannot partially
+preempt only one allocation of a multi-node victim job.
+
+## Expected Operator Signals
+
+- `Reason=PreemptionPlanned`: the concrete transaction exists, but at least one planned victim has
+  not yet received preemption.
+- `Reason=Preempting`: grace, victim exit, or pinned-node cleanup is in progress.
+- `Reason=HetjobPartialLaunch`: at least one component started and remaining components are still
+  committed.
+- `SystemComment=LaunchTxn: ... grace ...`: QOS grace is currently the expected wait.
+- `SystemComment=LaunchTxn: preemption complete; waiting for pinned nodes to finish cleanup ...`:
+  victim records cleared, but the exact launch still returns `ESLURM_NODES_BUSY`.
+
+## Regression Matrix
+
+Before production rollout, exercise at least these cases and inspect controller logs, `squeue`,
+`scontrol show job`, victim `PreemptTime`, and final node allocation:
+
+| Case | Required result |
+| --- | --- |
+| Ordinary job, no preemption | Starts normally; no lingering ownership |
+| Ordinary job, five-minute grace | Victims receive preemption once; owner starts on the pinned nodes after grace and cleanup |
+| Later higher-priority job arrives during cleanup | Later job cannot acquire committed nodes; it uses other capacity or remains pending |
+| Ordinary transaction exceeds safety timeout | Ownership releases once; job returns to normal planning |
+| Hetjob with multiple preempting components | Every component's planned victims are initiated before the first component starts |
+| Hetjob component hits cleanup delay | Already-started components remain running; delayed component retries its exact bitmap |
+| Hetjob cancelled before any component starts | Ownership and transaction status clear |
+| Hetjob cancelled after partial launch | Remaining ownership clears without scheduler-driven rollback of started components |
+| Planned node drains or fails | Validation invalidates and releases the transaction rather than waiting forever |
+| Controller restart during a transaction | In-memory ownership is gone and stale `LaunchTxn:` status is cleared on backfill startup |

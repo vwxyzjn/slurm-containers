@@ -1,0 +1,456 @@
+--- a/src/slurmctld/node_scheduler.h
++++ b/src/slurmctld/node_scheduler.h
+@@ -127,6 +127,12 @@
+  */
+ extern void re_kill_job(job_record_t *job_ptr);
+ 
++extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
++				       bitstr_t *usable_node_mask);
++extern void bf_launch_txn_release_nodes(uint32_t owner_id);
++extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
++					bitstr_t *node_bitmap);
++
+ /*
+  * select_nodes - select and allocate nodes to a specific job
+  * IN job_node_select - pointer with at least a pointer to the job record
+--- a/src/slurmctld/node_scheduler.c
++++ b/src/slurmctld/node_scheduler.c
+@@ -123,6 +123,14 @@
+ 	NM_TYPES	/* Number of node types */
+ };
+ 
++typedef struct {
++	uint32_t owner_id;
++	bitstr_t *node_bitmap;
++} bf_launch_txn_nodes_t;
++
++static list_t *bf_launch_txn_nodes = NULL;
++static pthread_mutex_t bf_launch_txn_nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
++
+ static int  _build_node_list(job_record_t *job_ptr,
+ 			     struct node_set **node_set_pptr,
+ 			     int *node_set_size, char **err_msg,
+@@ -152,6 +160,101 @@
+ 				 config_record_t *config_ptr,
+ 				 bool can_reboot, bitstr_t *reboot_bitmap);
+ 
++static void _bf_launch_txn_nodes_del(void *x)
++{
++	bf_launch_txn_nodes_t *record = x;
++
++	if (!record)
++		return;
++	FREE_NULL_BITMAP(record->node_bitmap);
++	xfree(record);
++}
++
++extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
++				       bitstr_t *usable_node_mask)
++{
++	bf_launch_txn_nodes_t *record;
++	list_itr_t *iter;
++	uint32_t owner_id;
++
++	if (!job_ptr || !usable_node_mask)
++		return;
++
++	owner_id = job_ptr->het_job_id ? job_ptr->het_job_id : job_ptr->job_id;
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_nodes) {
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++
++	iter = list_iterator_create(bf_launch_txn_nodes);
++	while ((record = list_next(iter))) {
++		if (record->owner_id != owner_id)
++			bit_and_not(usable_node_mask, record->node_bitmap);
++	}
++	list_iterator_destroy(iter);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_release_nodes(uint32_t owner_id)
++{
++	bf_launch_txn_nodes_t *record;
++	list_itr_t *iter;
++
++	if (!owner_id)
++		return;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_nodes) {
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++
++	iter = list_iterator_create(bf_launch_txn_nodes);
++	while ((record = list_next(iter))) {
++		if (record->owner_id != owner_id)
++			continue;
++		list_delete_item(iter);
++		break;
++	}
++	list_iterator_destroy(iter);
++	if (!list_count(bf_launch_txn_nodes))
++		FREE_NULL_LIST(bf_launch_txn_nodes);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
++					bitstr_t *node_bitmap)
++{
++	bf_launch_txn_nodes_t *record;
++	list_itr_t *iter;
++
++	if (!owner_id || !node_bitmap)
++		return;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_nodes)
++		bf_launch_txn_nodes = list_create(_bf_launch_txn_nodes_del);
++
++	iter = list_iterator_create(bf_launch_txn_nodes);
++	while ((record = list_next(iter))) {
++		if (record->owner_id != owner_id)
++			continue;
++		FREE_NULL_BITMAP(record->node_bitmap);
++		record->node_bitmap = bit_copy(node_bitmap);
++		list_iterator_destroy(iter);
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++	list_iterator_destroy(iter);
++
++	record = xmalloc(sizeof(*record));
++	record->owner_id = owner_id;
++	record->node_bitmap = bit_copy(node_bitmap);
++	list_append(bf_launch_txn_nodes, record);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
+ /*
+  * _get_ntasks_per_core - Retrieve the value of ntasks_per_core from
+  *	the given job_details record.  If it wasn't set, return INFINITE16.
+@@ -1777,6 +1880,13 @@
+ 			}
+ 
+ 			bit_and(node_set_ptr[i].my_bitmap, avail_node_bitmap);
++			if (!nodes_busy)
++				count1 = bit_set_count(node_set_ptr[i].my_bitmap);
++			bf_launch_txn_filter_nodes(job_ptr,
++						   node_set_ptr[i].my_bitmap);
++			if (!nodes_busy &&
++			    (count1 != bit_set_count(node_set_ptr[i].my_bitmap)))
++				nodes_busy = true;
+ 			if (!nodes_busy) {
+ 				count1 = bit_set_count(node_set_ptr[i].
+ 						       my_bitmap);
+@@ -1836,6 +1946,7 @@
+ 			FREE_NULL_LIST(*preemptee_job_list);
+ 			if (job_ptr->details->req_node_bitmap == NULL)
+ 				bit_and(avail_bitmap, avail_node_bitmap);
++			bf_launch_txn_filter_nodes(job_ptr, avail_bitmap);
+ 
+ 			bit_and(avail_bitmap, share_node_bitmap);
+ 
+@@ -1863,6 +1974,7 @@
+ 				list_iterator_destroy(job_iterator);
+ 				bit_and(avail_bitmap, avail_node_bitmap);
+ 				bit_and(avail_bitmap, total_bitmap);
++				bf_launch_txn_filter_nodes(job_ptr, avail_bitmap);
+ 				preemptee_cand = preemptee_candidates;
+ 			} else
+ 				preemptee_cand = preemptee_candidates;
+@@ -1919,6 +2031,10 @@
+ 		} /* for (i = 0; i < node_set_size; i++) */
+ 
+ 		/* try to get req_nodes now for this feature */
++		if (avail_bitmap) {
++			bf_launch_txn_filter_nodes(job_ptr, avail_bitmap);
++			avail_nodes = bit_set_count(avail_bitmap);
++		}
+ 		if (avail_bitmap && (!tried_sched)	&&
+ 		    (avail_nodes >= min_nodes)		&&
+ 		    ((job_ptr->details->req_node_bitmap == NULL) ||
+@@ -1972,6 +2088,7 @@
+ 				FREE_NULL_BITMAP(avail_bitmap);
+ 				avail_bitmap = bit_copy(total_bitmap);
+ 				bit_and(avail_bitmap, avail_node_bitmap);
++				bf_launch_txn_filter_nodes(job_ptr, avail_bitmap);
+ 				job_ptr->details->pn_min_memory = orig_req_mem;
+ 				pick_code = select_g_job_test(job_ptr,
+ 						avail_bitmap,
+--- a/src/plugins/sched/backfill/backfill.c
++++ b/src/plugins/sched/backfill/backfill.c
+@@ -189,13 +189,14 @@
+ 	uint32_t uninitiated_count;
+ 	time_t grace_deadline;
+ 	time_t grace_duration;
++	bool waiting_for_nodes;
+ 	list_t *blocker_job_ids;
+ } launch_preempt_status_t;
+ 
+ typedef enum {
+ 	HET_START_OK = SLURM_SUCCESS,
+ 	HET_START_FAILED = SLURM_ERROR,
+-	HET_START_WAIT_PREEMPT = 1,
++	HET_START_WAIT_RESOURCES = 1,
+ } het_start_rc_t;
+ 
+ typedef struct {
+@@ -327,7 +328,8 @@
+ static void _job_launch_set_state(job_record_t *job_ptr,
+ 				  const char *state_desc);
+ static void _job_launch_update_status(job_record_t *job_ptr,
+-				      job_launch_t *launch, time_t now);
++				      job_launch_t *launch, time_t now,
++				      bool waiting_for_nodes);
+ static void _launch_txn_add_preempt_status(
+ 	launch_preempt_status_t *status, job_record_t *preemptor,
+ 	bitstr_t *planned_node_bitmap, list_t *planned_preemptee_job_ids,
+@@ -354,6 +356,7 @@
+ 					  job_record_t *job_ptr);
+ static void _het_job_clear_launch_status(het_job_map_t *map);
+ static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
++					  bool waiting_for_nodes,
+ 					  const char *detail);
+ static list_t *_het_job_select_planned_preemptee_ids(
+ 	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
+@@ -3442,12 +3445,15 @@
+ 					_job_launch_clear(job_launch,
+ 							  "job started");
+ 					job_launch = NULL;
+-				} else if ((rc == ESLURM_NODES_BUSY) &&
+-					   (launch_preemption_pending ||
+-					    _job_launch_preempt_planned_jobs(
+-						    job_ptr, job_launch))) {
+-					_job_launch_update_status(job_ptr, job_launch,
+-							  now);
++				} else if (rc == ESLURM_NODES_BUSY) {
++					bool victims_pending =
++						launch_preemption_pending ||
++						_job_launch_preempt_planned_jobs(
++							job_ptr, job_launch);
++
++					_job_launch_update_status(
++						job_ptr, job_launch, now,
++						!victims_pending);
+ 				} else {
+ 					_job_launch_clear(job_launch,
+ 							  slurm_strerror(rc));
+@@ -4617,9 +4623,15 @@
+ 		return NULL;
+ 
+ 	if (irrevocable && !status->blocker_count) {
+-		xstrfmtcat(comment,
+-			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
+-			   "partial launch committed; waiting for remaining components; no automatic timeout");
++		if (status->waiting_for_nodes) {
++			xstrfmtcat(comment,
++				   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++				   "partial launch committed; waiting for pinned nodes to finish cleanup; no automatic timeout");
++		} else {
++			xstrfmtcat(comment,
++				   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++				   "partial launch committed; waiting for remaining components; no automatic timeout");
++		}
+ 	} else if (status->blocker_count &&
+ 		   (status->uninitiated_count == status->blocker_count)) {
+ 		xstrfmtcat(comment,
+@@ -4652,6 +4664,10 @@
+ 			   "grace elapsed; waiting for %u job%s to release resources",
+ 			   status->blocker_count,
+ 			   (status->blocker_count == 1) ? "" : "s");
++	} else if (status->waiting_for_nodes) {
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++			   "preemption complete; waiting for pinned nodes to finish cleanup");
+ 	} else {
+ 		xstrfmtcat(comment,
+ 			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX "pinned plan ready");
+@@ -4679,6 +4695,7 @@
+ 	if (!launch)
+ 		return;
+ 
++	bf_launch_txn_release_nodes(launch->job_id);
+ 	job_ptr = find_job_record(launch->job_id);
+ 	if (job_ptr) {
+ 		_launch_txn_clear_status(job_ptr);
+@@ -4704,7 +4721,8 @@
+ }
+ 
+ static void _job_launch_update_status(job_record_t *job_ptr,
+-				      job_launch_t *launch, time_t now)
++				      job_launch_t *launch, time_t now,
++				      bool waiting_for_nodes)
+ {
+ 	launch_preempt_status_t status = { 0 };
+ 	char *comment;
+@@ -4715,9 +4733,10 @@
+ 	_launch_txn_add_preempt_status(&status, job_ptr,
+ 				       launch->planned_node_bitmap,
+ 				       launch->planned_preemptee_job_ids, now);
++	status.waiting_for_nodes = waiting_for_nodes;
+ 	_job_launch_set_state(job_ptr,
+-			      (status.blocker_count &&
+-			       !status.uninitiated_count) ?
++			      (!status.uninitiated_count &&
++			       (status.blocker_count || waiting_for_nodes)) ?
+ 			      "Preempting" : "PreemptionPlanned");
+ 	comment = _launch_txn_make_system_comment(
+ 		&status, now, launch->launch_start, bf_job_commit_timeout, false);
+@@ -4916,8 +4935,10 @@
+ 	job_ptr->bf_launch_transaction = true;
+ 	list_append(job_launch_list, launch);
+ 	_job_launch_rebuild_bitmap();
++	bf_launch_txn_reserve_nodes(job_ptr->job_id,
++				    launch->planned_node_bitmap);
+ 
+-	_job_launch_update_status(job_ptr, launch, launch->launch_start);
++	_job_launch_update_status(job_ptr, launch, launch->launch_start, false);
+ 	log_flag(BACKFILL, "%pJ opened launch transaction for pinned nodes",
+ 		 job_ptr);
+ 
+@@ -5130,6 +5151,7 @@
+ }
+ 
+ static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
++					  bool waiting_for_nodes,
+ 					  const char *detail)
+ {
+ 	launch_preempt_status_t status = { 0 };
+@@ -5153,10 +5175,12 @@
+ 			rec->planned_preemptee_job_ids, now);
+ 	}
+ 	list_iterator_destroy(iter);
++	status.waiting_for_nodes = waiting_for_nodes;
+ 
+-	if (status.blocker_count) {
+-		_het_job_set_state_desc(map, status.uninitiated_count ?
+-					"PreemptionPlanned" : "Preempting");
++	if (status.uninitiated_count) {
++		_het_job_set_state_desc(map, "PreemptionPlanned");
++	} else if (status.blocker_count || waiting_for_nodes) {
++		_het_job_set_state_desc(map, "Preempting");
+ 	} else if (irrevocable) {
+ 		_het_job_set_state_desc(map, "HetjobPartialLaunch");
+ 	} else {
+@@ -5180,12 +5204,13 @@
+ 	FREE_NULL_LIST(status.blocker_job_ids);
+ }
+ 
+-static void _het_job_set_launch_wait_state(het_job_map_t *map, time_t now)
++static void _het_job_set_launch_wait_state(het_job_map_t *map, time_t now,
++					   bool waiting_for_nodes)
+ {
+ 	if (!map || (map->launch_state != HET_LAUNCH_COMMITTED))
+ 		return;
+ 
+-	_het_job_update_launch_status(map, now, NULL);
++	_het_job_update_launch_status(map, now, waiting_for_nodes, NULL);
+ }
+ 
+ static bitstr_t *_het_job_launch_build_bitmap(het_job_map_t *map)
+@@ -5384,7 +5409,7 @@
+ 	    _het_job_launch_cannot_continue(map))
+ 		return false;
+ 
+-	_het_job_update_launch_status(map, time(NULL), reason);
++	_het_job_update_launch_status(map, time(NULL), false, reason);
+ 	log_flag(HETJOB,
+ 		 "Hetjob %u partial launch remains committed: %s",
+ 		 map->het_job_id, reason ? reason : "retrying remaining components");
+@@ -5402,6 +5427,7 @@
+ 	if (!map || (map->launch_state != HET_LAUNCH_COMMITTED))
+ 		return;
+ 
++	bf_launch_txn_release_nodes(map->het_job_id);
+ 	log_flag(HETJOB, "Hetjob %u launch transaction released: %s",
+ 		 map->het_job_id, reason ? reason : "unknown");
+ 	map->launch_state = HET_LAUNCH_NONE;
+@@ -5535,6 +5561,7 @@
+ 
+ static bool _het_job_launch_begin(het_job_map_t *map)
+ {
++	bitstr_t *launch_bitmap;
+ 	char *reason = NULL, *state_desc = NULL;
+ 	time_t now = time(NULL);
+ 
+@@ -5580,8 +5607,11 @@
+ 	map->launch_state = HET_LAUNCH_COMMITTED;
+ 	map->launch_start = now;
+ 	_het_job_launch_rebuild_bitmap();
++	launch_bitmap = _het_job_launch_build_bitmap(map);
++	bf_launch_txn_reserve_nodes(map->het_job_id, launch_bitmap);
++	FREE_NULL_BITMAP(launch_bitmap);
+ 
+-	_het_job_update_launch_status(map, now, NULL);
++	_het_job_update_launch_status(map, now, false, NULL);
+ 
+ 	log_flag(HETJOB, "Hetjob %u launch transaction opened for planned nodes",
+ 		 map->het_job_id);
+@@ -5596,6 +5626,7 @@
+ {
+ 	het_job_map_t *map = (het_job_map_t *) x;
+ 
++	bf_launch_txn_release_nodes(map->het_job_id);
+ 	_het_job_clear_launch_status(map);
+ 	FREE_NULL_LIST(map->het_job_rec_list);
+ 	xfree(map);
+@@ -6282,17 +6313,11 @@
+ 			log_flag(HETJOB, "%pJ started", job_ptr);
+ 			_het_job_add_used_nodes(&used_bitmap, job_ptr);
+ 		} else {
+-			bool preempt_wait =
+-				job_ptr->preempt_in_progress ||
+-				(job_ptr->details &&
+-				 job_ptr->details->preempt_start_time);
+ 			fed_mgr_job_unlock(job_ptr);
+ 			if (bf_hetjob_commit_timeout &&
+ 			    (rc == ESLURM_NODES_BUSY) &&
+-			    (map->launch_state == HET_LAUNCH_COMMITTED) &&
+-			    (preempt_wait ||
+-			     _het_job_preempt_planned_jobs(job_ptr, rec))) {
+-				start_rc = HET_START_WAIT_PREEMPT;
++			    (map->launch_state == HET_LAUNCH_COMMITTED)) {
++				start_rc = HET_START_WAIT_RESOURCES;
+ 			} else {
+ 				start_rc = HET_START_FAILED;
+ 			}
+@@ -6402,7 +6427,7 @@
+ 	map->prev_start = _het_job_start_compute(map, 0);
+ 	if (map->prev_start > now) {
+ 		if (map->launch_state == HET_LAUNCH_COMMITTED) {
+-			_het_job_set_launch_wait_state(map, now);
++			_het_job_set_launch_wait_state(map, now, false);
+ 		} else {
+ 			char *state_desc = NULL;
+ 			xstrfmtcat(state_desc,
+@@ -6434,13 +6459,13 @@
+ 		return false;
+ 	}
+ 	if (_het_job_preempt_planned_components(map)) {
+-		_het_job_set_launch_wait_state(map, now);
++		_het_job_set_launch_wait_state(map, now, false);
+ 		map->prev_start = now + 1;
+ 		return false;
+ 	}
+ 
+ 	rc = _het_job_start_now(map, node_space);
+-	if (rc == HET_START_WAIT_PREEMPT) {
++	if (rc == HET_START_WAIT_RESOURCES) {
+ 		bool partial_launch =
+ 			_het_job_latch_started_components(map);
+ 		bool launch_wait_ok;
+@@ -6453,8 +6478,8 @@
+ 			   bf_hetjob_commit_timeout)));
+ 
+ 		if (launch_wait_ok) {
+-			_het_job_set_launch_wait_state(map, now);
+-			log_flag(HETJOB, "Hetjob %u preemption started; waiting for cleanup",
++			_het_job_set_launch_wait_state(map, now, true);
++			log_flag(HETJOB, "Hetjob %u pinned nodes remain busy; retrying exact plan",
+ 				 map->het_job_id);
+ 			map->prev_start = now + 1;
+ 			return false;
