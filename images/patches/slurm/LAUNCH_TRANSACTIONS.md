@@ -4,7 +4,7 @@
 
 Preemption must have commit semantics for both ordinary and heterogeneous jobs:
 
-1. Backfill selects one concrete node and victim plan.
+1. Backfill selects one concrete node and sufficient victim plan.
 2. Slurm commits that plan before initiating any victim preemption.
 3. QOS grace time is honored normally.
 4. The intended job retries the same nodes while victims exit and node/GRES cleanup finishes.
@@ -34,6 +34,26 @@ This means jobs were preempted for `2131756`, but that launch attempt did not re
 it created. The job did not enter a terminal failed state; it returned to normal pending/replanning.
 That distinction does not make the behavior safe: repeated replanning can preempt another victim
 set and create a preemption storm without making forward progress.
+
+## 2026-07-13 Shared-Node Over-Preemption Incident
+
+Ordinary job `2135825` requested four CPUs and 16 GiB on one `turin-cpu-shared` node. At
+`21:53:53`, less than one second after submission, a non-backfill allocation path signaled one
+two-CPU victim on `slurm-turin-cpu-shared-220-197`. At `21:54:02`, backfill selected a different
+node, `slurm-turin-cpu-shared-220-221`, and signaled every preemptible job on it: 32 jobs at six
+CPUs each, consuming all 192 effective CPUs. The configured 300-second QOS grace was honored, but
+the victim set was grossly larger than the four-CPU request. The owner eventually started on
+`220-221` at `22:01:20`.
+
+Two independent behaviors caused this incident:
+
+- Transaction victim reconstruction used `SELECT_MODE_WILL_RUN`. The `select/cons_tres`
+  implementation appends every preemptible candidate overlapping the selected bitmap in that
+  mode; it does not stop after enough CPUs, memory, and GRES have been recovered.
+- Submit-time or main-scheduler `select_nodes()` could signal a preemption before backfill created
+  a transaction. Slurm treats `preempt_in_progress` as queue-build scratch state and clears it
+  while rebuilding scheduler queues, so it is not a durable handoff between the two schedulers.
+  Backfill could therefore commit and signal a second, disjoint plan for the same owner.
 
 ## Root Cause
 
@@ -160,10 +180,33 @@ updates, and automatic node selection remove launch-owned nodes even for `MAINT`
 reservations. An active launch commit therefore wins for its bounded lifetime; cancel the owner
 first when an emergency reservation must claim those exact nodes.
 
+## Minimal Victims and Scheduler Handoff
+
+Patch `0035-launch-transaction-minimal-victims.patch` makes backfill the only preemption initiator
+for ordinary jobs while ordinary launch transactions are enabled. Submit-time and main-scheduler
+allocation still start jobs that fit on immediately free resources. If starting would require
+preemption, they return `ESLURM_NODES_BUSY` without signaling a victim and leave the job for
+backfill. The job may therefore show `Reason=Resources` briefly before the next backfill pass opens
+its transaction.
+
+For the already-selected pinned bitmap, backfill now calls the normal `SELECT_MODE_RUN_NOW`
+preemption simulator rather than `SELECT_MODE_WILL_RUN`. It detaches the pending job's existing
+resource pointer and runs against temporary copies of its GRES request state before the test. It
+frees the simulated allocation and GRES state afterward, so planning cannot allocate or mutate the
+pending job. The returned victim IDs are the sufficient prefix chosen by Slurm's normal run-now
+preemption ordering. Backfill commits node ownership and those IDs before it calls
+`slurm_job_preempt()`, after which the victims' configured QOS `GraceTime` remains authoritative.
+
+Victims remain indivisible jobs. A four-CPU request can preempt one six-CPU job, and one selected
+multi-node victim can release nodes outside the pinned bitmap. The patch prevents selecting every
+colocated candidate and prevents parallel scheduler plans; it does not split a victim allocation
+or redefine Slurm's preemption ordering policy.
+
 ## Mitigation Levers
 
 `SchedulerParameters=bf_job_commit_timeout=0` plus `scontrol reconfigure` disables new ordinary
-launch transactions and drains open ones on the next backfill cycle. Setting
+launch transactions, restores submit-time and main-scheduler preemption, and drains open ones on
+the next backfill cycle. Setting
 `bf_hetjob_commit_timeout=0` prevents new hetjob commits; a not-yet-started committed transaction
 finishes safe victim cleanup before returning to ordinary planning. An already partially launched
 hetjob remains irrevocable and must be cancelled explicitly. Rolling back the controller image to
@@ -204,23 +247,27 @@ against a higher-priority main-scheduler decision.
 
 The combined patch stack is intended to maintain these invariants:
 
-1. A transaction stores one immutable node, victim, partition, QOS, and reservation plan.
-2. All planned hetjob component preemptions begin before any component launch is attempted.
-3. Only planned victims are initiated by the transaction; it never substitutes a new victim set.
-4. Committed nodes are unavailable to every non-owner run-now selection.
-5. `ESLURM_NODES_BUSY` retries the exact plan instead of releasing it merely because victim job
+1. With ordinary launch transactions enabled, submit-time and main scheduling never initiate a
+   competing preemption plan; backfill owns victim selection and signaling.
+2. A transaction stores one immutable node, victim, partition, QOS, and reservation plan.
+3. The planned victim list is the sufficient prefix selected by Slurm's run-now preemption
+   algorithm for the exact pinned bitmap, not every preemptible job resident on those nodes.
+4. All planned hetjob component preemptions begin before any component launch is attempted.
+5. Only planned victims are initiated by the transaction; it never substitutes a new victim set.
+6. Committed nodes are unavailable to every non-owner run-now selection.
+7. `ESLURM_NODES_BUSY` retries the exact plan instead of releasing it merely because victim job
    records have disappeared.
-6. A validation failure after victim signaling enters cleanup and cannot select replacement
+8. A validation failure after victim signaling enters cleanup and cannot select replacement
    victims until every original victim has left and the bounded cooldown has elapsed.
-7. Ordinary jobs and not-yet-started hetjobs retain the configured 30-minute safety timeout.
-8. Before the first hetjob component starts, every remaining component passes an exact run-now
+9. Ordinary jobs and not-yet-started hetjobs retain the configured 30-minute safety timeout.
+10. Before the first hetjob component starts, every remaining component passes an exact run-now
    readiness test on its pinned nodes without replacement preemptee candidates.
-9. A partial hetjob launch is irrevocable and continues retrying remaining components without an
+11. A partial hetjob launch is irrevocable and continues retrying remaining components without an
    automatic timeout or rollback.
-10. Reservation placement cannot consume transaction-owned nodes while the commit is active.
-11. Terminal job state releases ownership rather than leaving stale capacity hidden from the
+12. Reservation placement cannot consume transaction-owned nodes while the commit is active.
+13. Terminal job state releases ownership rather than leaving stale capacity hidden from the
     scheduler.
-12. QOS grace time remains authoritative; node ownership, cleanup, and replan cooldown do not
+14. QOS grace time remains authoritative; node ownership, cleanup, and replan cooldown do not
     shorten or bypass it.
 
 These guarantees do not make launch unconditional. A node can fail, be drained, lose required
@@ -237,6 +284,8 @@ preempt only one allocation of a multi-node victim job.
 
 ## Expected Operator Signals
 
+- `Reason=Resources` immediately after submission: no victim has been signaled yet; the job is
+  waiting for backfill to select and commit one transaction plan.
 - `Reason=PreemptionPlanned`: the concrete transaction exists, but at least one planned victim has
   not yet received preemption.
 - `Reason=Preempting`: grace, victim exit, or pinned-node cleanup is in progress.
@@ -258,6 +307,8 @@ Before production rollout, exercise at least these cases and inspect controller 
 | Case | Required result |
 | --- | --- |
 | Ordinary job, no preemption | Starts normally; no lingering ownership |
+| Four-CPU ordinary job on a full 192-CPU shared node with 32 six-CPU preemptible jobs | Exactly one sufficient six-CPU victim is selected and signaled; the other 31 continue running |
+| Submit-time and main scheduling evaluate a job before backfill commits | No victim receives `PreemptTime`; backfill later opens and signals one plan without a disjoint preliminary victim set |
 | Ordinary job, five-minute grace | Victims receive preemption once; owner starts on the pinned nodes after grace and cleanup |
 | Later higher-priority job arrives during cleanup | Later job cannot acquire committed nodes; it uses other capacity or remains pending |
 | Ordinary transaction exceeds safety timeout after signaling victims | No new victims are selected; original victims drain, ownership releases, and the bounded replan cooldown begins |
@@ -279,5 +330,5 @@ Before production rollout, exercise at least these cases and inspect controller 
 | First failed victim plan | Original victims drain, nodes unfence, and exactly one replacement plan is allowed after the default 300-second cooldown |
 | Replacement victim plan also fails | Owner remains pending with a blocked `SystemComment`; no third victim wave occurs |
 | Explicit, automatic, `MAINT`, or `OVERLAP` reservation targets committed nodes | Reservation uses other nodes or returns nodes busy; it cannot acquire the launch-owned nodes |
-| `bf_job_commit_timeout=0` set via reconfigure with open transactions | New ordinary transactions stop and open ones drain; a not-yet-started het transaction finishes safe cleanup, while a partial launch requires explicit cancellation |
+| `bf_job_commit_timeout=0` set via reconfigure with open transactions | New ordinary transactions stop, legacy submit/main preemption resumes, and open ones drain; a not-yet-started het transaction finishes safe cleanup, while a partial launch requires explicit cancellation |
 | Controller restart during a transaction | In-memory ownership is gone and stale `LaunchTxn:` status is cleared on backfill startup |

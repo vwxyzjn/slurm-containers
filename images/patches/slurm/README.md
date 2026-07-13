@@ -40,6 +40,7 @@ licenses.
   - [0032-launch-transaction-node-ownership.patch](#0032-launch-transaction-node-ownershippatch)
   - [0033-launch-transaction-reliability.patch](#0033-launch-transaction-reliabilitypatch)
   - [0034-launch-transaction-bounded-replan.patch](#0034-launch-transaction-bounded-replanpatch)
+  - [0035-launch-transaction-minimal-victims.patch](#0035-launch-transaction-minimal-victimspatch)
 
 ### 0001-max-server-threads
 
@@ -419,3 +420,31 @@ transactions, including `MAINT` and `OVERLAP` placement. The short-lived launch
 commit wins; an operator can cancel the owner before placing an emergency
 reservation on those exact nodes. Retry and block state is controller-local
 and is cleared with stale transaction status when the backfill agent restarts.
+
+### 0035-launch-transaction-minimal-victims.patch
+
+This patch prevents a small job on a consumable-resource node from preempting
+every preemptible job resident on that node. The transaction planner previously
+used `SELECT_MODE_WILL_RUN` to reconstruct victims for an already-selected
+bitmap. In `select/cons_tres`, that mode returns every preemptible candidate
+overlapping the selected nodes. A four-CPU job therefore selected 32 six-CPU
+victims and disrupted all 192 CPUs on one shared node.
+
+Pinned victim reconstruction now uses Slurm's existing
+`SELECT_MODE_RUN_NOW` preemption simulation. That algorithm removes candidates
+until the request fits and returns the sufficient victim prefix selected by
+Slurm's normal run-now ordering. The helper detaches any existing
+`job_resrcs`, copies the resulting victim IDs, discards the simulated
+allocation, and restores the original pointer. It never allocates nodes or
+signals victims during planning. The simulator also runs against temporary
+copies of the job's GRES request state so a GPU selection cannot leak into the
+pending job record.
+
+The patch also prevents two schedulers from initiating independent plans for
+the same ordinary job. While `bf_job_commit_timeout` is enabled, submit-time
+and main-scheduler allocation may still start a job on immediately free
+resources, but they return nodes busy instead of signaling preemptees. Backfill
+then selects, registers, and signals the single committed plan. Setting
+`bf_job_commit_timeout=0` restores the legacy non-transactional preemption path.
+QOS `GraceTime` remains authoritative after the transaction signals its
+selected victims.

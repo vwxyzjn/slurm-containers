@@ -1,0 +1,167 @@
+--- a/src/slurmctld/node_scheduler.h
++++ b/src/slurmctld/node_scheduler.h
+@@ -132,6 +132,7 @@
+ extern void bf_launch_txn_filter_reservation_nodes(
+ 	bitstr_t *usable_node_mask);
+ extern bool bf_launch_txn_overlap_nodes(bitstr_t *node_bitmap);
++extern void bf_launch_txn_set_preemption_handoff(bool enabled);
+ extern void bf_launch_txn_release_nodes(uint32_t owner_id);
+ extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
+ 					bitstr_t *node_bitmap);
+--- a/src/slurmctld/node_scheduler.c
++++ b/src/slurmctld/node_scheduler.c
+@@ -130,6 +130,7 @@
+ 
+ static list_t *bf_launch_txn_nodes = NULL;
+ static pthread_mutex_t bf_launch_txn_nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
++static bool bf_launch_txn_preemption_handoff = false;
+ 
+ static int  _build_node_list(job_record_t *job_ptr,
+ 			     struct node_set **node_set_pptr,
+@@ -170,6 +171,28 @@
+ 	xfree(record);
+ }
+ 
++extern void bf_launch_txn_set_preemption_handoff(bool enabled)
++{
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	bf_launch_txn_preemption_handoff = enabled;
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++static bool _bf_launch_txn_should_defer_preemption(uint32_t scheduler_type)
++{
++	bool defer;
++
++	if (!(scheduler_type & (SLURMDB_JOB_FLAG_SUBMIT |
++				SLURMDB_JOB_FLAG_SCHED)))
++		return false;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	defer = bf_launch_txn_preemption_handoff;
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++
++	return defer;
++}
++
+ extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
+ 				       bitstr_t *usable_node_mask)
+ {
+@@ -2922,7 +2945,11 @@
+ 	job_ptr->cpu_cnt = job_ptr->total_cpus;
+ 
+ 	if (!test_only && preemptee_job_list
+-	    && (error_code == SLURM_SUCCESS)) {
++	    && (error_code == SLURM_SUCCESS) &&
++	    _bf_launch_txn_should_defer_preemption(scheduler_type)) {
++		error_code = ESLURM_NODES_BUSY;
++	} else if (!test_only && preemptee_job_list
++		   && (error_code == SLURM_SUCCESS)) {
+ 		job_details_t *detail_ptr = job_ptr->details;
+ 		time_t now = time(NULL);
+ 		bool kill_pending = true;
+--- a/src/plugins/sched/backfill/backfill.c
++++ b/src/plugins/sched/backfill/backfill.c
+@@ -69,6 +69,7 @@
+ 
+ #include "src/common/assoc_mgr.h"
+ #include "src/common/job_features.h"
++#include "src/common/job_resources.h"
+ #include "src/common/list.h"
+ #include "src/common/macros.h"
+ #include "src/common/parse_time.h"
+@@ -409,7 +410,7 @@
+ static list_t *_het_job_select_planned_preemptee_ids(
+ 	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
+ 	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
+-	resv_exc_t *resv_exc_ptr, will_run_data_t *will_run);
++	resv_exc_t *resv_exc_ptr);
+ static bool _het_job_launch_active(uint32_t het_job_id);
+ static bool _het_job_all_components_ready(het_job_map_t *map, char **reason);
+ static bool _het_job_launch_begin(het_job_map_t *map);
+@@ -1179,6 +1180,8 @@
+ 			bf_job_commit_timeout = BF_JOB_COMMIT_TIMEOUT;
+ 		}
+ 	}
++	bf_launch_txn_set_preemption_handoff(
++		(bf_job_commit_timeout > 0) && (backfill_interval != -1));
+ 
+ 	bf_launch_replan_delay = BF_LAUNCH_REPLAN_DELAY;
+ 	if ((tmp_ptr = xstrcasestr(sched_params,
+@@ -1338,6 +1341,7 @@
+ 	FREE_NULL_LIST(job_launch_list);
+ 	FREE_NULL_LIST(het_job_list);
+ 	FREE_NULL_BITMAP(planned_bitmap);
++	bf_launch_txn_set_preemption_handoff(false);
+ }
+ 
+ /* backfill_agent - detached thread periodically attempts to backfill jobs */
+@@ -1444,6 +1448,7 @@
+ 	FREE_NULL_LIST(het_job_list);
+ 	_launch_txn_clear_stale_status();
+ 	unlock_slurmctld(all_locks);
++	bf_launch_txn_set_preemption_handoff(false);
+ 	xhash_free(user_usage_map); /* May have been init'ed if used */
+ 	FREE_NULL_BITMAP(planned_bitmap);
+ 
+@@ -3495,8 +3500,7 @@
+ 				planned_preemptee_job_ids =
+ 					_het_job_select_planned_preemptee_ids(
+ 						job_ptr, avail_bitmap, min_nodes,
+-						max_nodes, req_nodes, &resv_exc,
+-						&will_run_data);
++						max_nodes, req_nodes, &resv_exc);
+ 				if (planned_preemptee_job_ids &&
+ 				    list_count(planned_preemptee_job_ids)) {
+ 					job_launch = _job_launch_begin(
+@@ -3760,8 +3764,7 @@
+ 			planned_preemptee_job_ids =
+ 				_het_job_select_planned_preemptee_ids(
+ 					job_ptr, avail_bitmap, min_nodes,
+-					max_nodes, req_nodes, &resv_exc,
+-					&will_run_data);
++					max_nodes, req_nodes, &resv_exc);
+ 
+ 			_het_job_start_set(job_ptr, job_ptr->start_time,
+ 					   comp_time_limit, avail_bitmap,
+@@ -4551,11 +4554,13 @@
+ static list_t *_het_job_select_planned_preemptee_ids(
+ 	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
+ 	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
+-	resv_exc_t *resv_exc_ptr, will_run_data_t *will_run)
++	resv_exc_t *resv_exc_ptr)
+ {
+ 	list_t *preemptee_candidates, *preemptee_job_list = NULL;
+ 	list_t *planned_preemptee_job_ids = NULL;
++	list_t *orig_gres_list_req, *orig_gres_list_req_accum;
+ 	bitstr_t *test_bitmap;
++	job_resources_t *orig_job_resrcs;
+ 	time_t orig_start_time;
+ 	int rc;
+ 
+@@ -4568,10 +4573,23 @@
+ 
+ 	test_bitmap = bit_copy(planned_node_bitmap);
+ 	orig_start_time = job_ptr->start_time;
++	orig_job_resrcs = job_ptr->job_resrcs;
++	orig_gres_list_req = job_ptr->gres_list_req;
++	orig_gres_list_req_accum = job_ptr->gres_list_req_accum;
++	job_ptr->job_resrcs = NULL;
++	job_ptr->gres_list_req = gres_job_state_list_dup(orig_gres_list_req);
++	job_ptr->gres_list_req_accum =
++		gres_job_state_list_dup(orig_gres_list_req_accum);
+ 	rc = select_g_job_test(job_ptr, test_bitmap, min_nodes, max_nodes,
+-			       req_nodes, SELECT_MODE_WILL_RUN,
++			       req_nodes, SELECT_MODE_RUN_NOW,
+ 			       preemptee_candidates, &preemptee_job_list,
+-			       resv_exc_ptr, will_run);
++			       resv_exc_ptr, NULL);
++	free_job_resources(&job_ptr->job_resrcs);
++	FREE_NULL_LIST(job_ptr->gres_list_req);
++	FREE_NULL_LIST(job_ptr->gres_list_req_accum);
++	job_ptr->job_resrcs = orig_job_resrcs;
++	job_ptr->gres_list_req = orig_gres_list_req;
++	job_ptr->gres_list_req_accum = orig_gres_list_req_accum;
+ 	job_ptr->start_time = orig_start_time;
+ 
+ 	if (rc == SLURM_SUCCESS)
