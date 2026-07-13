@@ -15,6 +15,17 @@ The important property is not merely that enough aggregate capacity exists. Once
 jobs for a concrete plan, the resulting capacity must remain owned by that transaction until the
 intended launch has had a reliable opportunity to consume it.
 
+## Patch History
+
+The design below was developed and reviewed as a ten-patch series
+(`0024-hetjob-sticky-preempt` through `0033-launch-transaction-reliability`).
+The shipped artifact is the single consolidated
+[`0024-launch-transactions.patch`](0024-launch-transactions.patch), verified to
+produce a byte-identical source tree to the applied series. Numbered patch
+references in this document describe that design evolution; the per-step
+history is preserved on the `codex/job-launch-transaction-coreweave5` branch
+and in the pull requests that landed this work.
+
 ## 2026-07-13 Incident
 
 Ordinary job `2131756` committed a 24-node GPU plan with 87 blocking jobs. Slurm initiated the

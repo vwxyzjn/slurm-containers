@@ -29,16 +29,7 @@ licenses.
   - [0021-revert-remove-cg-limits.patch](#0021-revert-remove-cg-limitspatch)
   - [0022-move-persist-conn-shutdown.patch](#0022-move-persist-conn-shutdownpatch)
   - [0023-fail-bad-constraints.patch](#0023-fail-bad-constraintspatch)
-  - [0024-hetjob-sticky-preempt.patch](#0024-hetjob-sticky-preemptpatch)
-  - [0025-hetjob-pinned-plan.patch](#0025-hetjob-pinned-planpatch)
-  - [0026-hetjob-planned-preemptions.patch](#0026-hetjob-planned-preemptionspatch)
-  - [0027-hetjob-launch-transaction-clean.patch](#0027-hetjob-launch-transaction-cleanpatch)
-  - [0028-job-launch-transaction-clean.patch](#0028-job-launch-transaction-cleanpatch)
-  - [0029-hetjob-launch-all-components.patch](#0029-hetjob-launch-all-componentspatch)
-  - [0030-job-launch-preempt-before-start.patch](#0030-job-launch-preempt-before-startpatch)
-  - [0031-launch-transaction-status.patch](#0031-launch-transaction-statuspatch)
-  - [0032-launch-transaction-node-ownership.patch](#0032-launch-transaction-node-ownershippatch)
-  - [0033-launch-transaction-reliability.patch](#0033-launch-transaction-reliabilitypatch)
+  - [0024-launch-transactions.patch](#0024-launch-transactionspatch)
 
 ### 0001-max-server-threads
 
@@ -218,167 +209,44 @@ In SLURM when a job fails due to not being able to meet the segment size require
 
 This patch is to change it so that jobs that fail for unmet segment size requirements to not hold the job. So that if there are topology changes to the cluster, that can satisfy the job requirements, the job can still schedule. This will set the job reason to `Reason=Resources` instead of `Reason=BadConstraints`.
 
-### 0024-hetjob-sticky-preempt.patch
+### 0024-launch-transactions.patch
 
-This patch keeps a heterogeneous job start attempt sticky after preemption has begun.
-Without it, backfill can start one hetjob component, fail a later component while
-preempted jobs are still completing, roll back the already-started component, and
-then replan against a different target set. The patch adds
-`bf_hetjob_sticky_preempt_timeout`, defaulting to 30 minutes, so the scheduler can
-wait for preempted jobs to finish cleanup before rolling back.
+This patch gives preemption commit semantics ("launch transactions") for both
+ordinary and heterogeneous jobs. Without it, backfill can select a node set,
+initiate victim preemption, and then lose the freed capacity to another job
+while victims observe their QOS grace time and node/GRES cleanup completes --
+repeated replanning can then preempt fresh victim sets without forward
+progress (a preemption storm; see the 2026-07-13 production incident with job
+`2131756` in [`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md)).
 
-This is a local workaround for a production scheduling issue. It may be replaceable
-with an upstream fix if Slurm gains commit-style hetjob preemption semantics.
+With this patch, backfill commits one exact node and victim plan before
+signaling any victim, honors QOS grace normally, registers the pinned nodes in
+a controller-wide ownership registry (an owner-exempt filter in the common
+node-selection path that every run-now allocation traverses), retries the
+exact plan on `ESLURM_NODES_BUSY` through victim exit and cleanup, and
+releases on validation failure, cancellation, terminal state, or the safety
+timeout. Validation covers planned-node health (DOWN/DRAINING/FAIL), a
+queue-match watchdog for commit-attribute drift (for example a QOS change on
+the owner), and unplanned occupants. Once any hetjob component starts, the
+transaction is irrevocable: started components are never rolled back, and a
+held partial launch emits a rate-limited `error()` once it persists. Pending
+owners report `Reason=PreemptionPlanned/Preempting/HetjobPartialLaunch` with
+detailed timing in a namespaced `LaunchTxn:` `SystemComment`.
 
-### 0025-hetjob-pinned-plan.patch
+New `SchedulerParameters`: `bf_hetjob_commit_timeout` and
+`bf_job_commit_timeout` (seconds a validated transaction may be held while
+planned preemptions clear; default 1800; `0` disables new transactions and
+drains open ordinary ones -- an already committed or partially launched hetjob
+transaction must be cancelled explicitly).
 
-This patch pins hetjob immediate starts to the exact node bitmap selected by
-backfill. The unpatched path records `SchedNodeList` for display and reservation
-state, but `_het_job_start_now()` rebuilds a broad availability bitmap before
-calling `_start_job()`. On fragmented partitions that fresh search can fail to
-reconstruct the same concrete preemption plan and return `Requested nodes are busy`
-even when the displayed `SchedNodeList` is all preemptible.
-
-The patch stores the selected backfill bitmap on each het component record and
-intersects the immediate-start availability bitmap with that plan before calling
-`_start_job()`. Since `_start_job()` already treats its bitmap argument as excluded
-nodes, this forces `select/cons_tres` to validate and allocate the committed
-backfill plan instead of doing a broad fresh search. If the planned nodes are no
-longer available, the scheduler fails the committed attempt and rolls back rather
-than preempting an unrelated replacement set.
-
-### 0026-hetjob-planned-preemptions.patch
-
-This patch stores the QOS-preemptible victim job IDs that overlap each planned
-hetjob component bitmap. It covers the case where backfill has a concrete
-`SchedNodeList`, but the runtime `RUN_NOW` selection path returns
-`ESLURM_NODES_BUSY` before producing an actionable `preemptee_job_list`.
-
-When that happens on a pinned hetjob start, the scheduler now preempts the
-stored victims on the pinned bitmap and enters the existing sticky wait path.
-This makes the planned node bitmap and the victim list part of the same commit
-attempt, instead of repeatedly forecasting a workable plan without starting
-preemption.
-
-### 0027-hetjob-launch-transaction-clean.patch
-
-This patch replaces the incremental heterogeneous-job launch behavior with a
-single backfill launch transaction. After normal eligibility checks, it commits
-the exact node, victim, partition, QOS, and reservation plan; hides those nodes
-from competing schedules; and retries that exact plan while preempted jobs
-finish. The default `bf_hetjob_commit_timeout` is 30 minutes.
-
-### 0028-job-launch-transaction-clean.patch
-
-This patch extends launch transactions to ordinary jobs. It pins the selected
-nodes and planned victims, prevents main-scheduler rerouting, and retries the
-committed plan while preemptions clear. Ordinary and heterogeneous transactions
-also reject overlapping commits, so the first validated transaction owns the
-nodes until it starts, fails validation, or reaches its timeout. The default
-`bf_job_commit_timeout` is 30 minutes.
-
-### 0029-hetjob-launch-all-components.patch
-
-This patch makes a committed heterogeneous-job launch plan immutable, starts
-planned preemptions for every pending component before attempting to launch any
-component, and waits until all planned victims have released their resources.
-It also treats an already-active component preemption as transaction progress
-rather than a hard start failure. Once any component starts, the transaction is
-irrevocable: started components remain running, remaining planned nodes stay
-pinned, and retries continue past the normal transaction timeout until every
-component starts or the job is explicitly cancelled. Launched components are
-latched per transaction, so a component finishing does not make the scheduler
-forget the partial launch. Cancellation or another terminal state releases the
-remaining pins without deallocating components that already launched.
-
-### 0030-job-launch-preempt-before-start.patch
-
-This patch fixes a false wait in ordinary-job launch transactions. `_start_job()`
-can mark the target job as having preemption in progress and still return
-`ESLURM_NODES_BUSY` without preempting the transaction's planned victims. The
-old code treated that target-side state as sufficient proof of progress, and C
-short-circuit evaluation prevented the planned-victim helper from running. The
-transaction could therefore report that it was waiting for planned preemptions
-even though every victim remained running with no `PreemptTime`.
-
-Ordinary launch transactions now initiate their exact planned victims before
-attempting allocation. They retry any planned victim that is still running
-without a `PreemptTime`, wait while those jobs are running or completing on the
-pinned nodes, and only report a preemption wait while the helper still finds an
-exact planned victim occupying those nodes. A stale target-side
-`preempt_start_time` can no longer keep a no-op transaction alive.
-
-### 0031-launch-transaction-status.patch
-
-This patch separates the short operator-facing reason for a committed launch
-transaction from its detailed timing. Pending ordinary and heterogeneous jobs
-now use categorical reasons such as `PreemptionPlanned`, `Preempting`, and
-`HetjobPartialLaunch`, so `squeue` no longer presents the 30-minute transaction
-safety timeout as though it were the expected preemption wait.
-
-Detailed progress is written to the job's `SystemComment`, which is displayed by
-`scontrol show job`. The namespaced `LaunchTxn:` comment reports the number of
-blocking planned victims, the remaining grace time and effective total grace
-derived from those victims' `PreemptTime` and `EndTime`, a cleanup phase after
-grace expires, and the transaction's absolute safety deadline. For an
-irrevocable partial heterogeneous-job launch it instead states that no automatic
-timeout applies.
-
-The scheduler only updates or clears `SystemComment` values that begin with its
-own `LaunchTxn:` prefix, preserving unrelated administrator comments. It clears
-owned comments when a transaction ends and removes stale owned status when the
-backfill scheduler starts after a controller restart.
-
-Categorical launch reasons are cleared independently of `SystemComment`
-ownership, so preserving an administrator comment cannot leave a stale
-`Preempting` reason. Heterogeneous-job status aggregation ignores components
-that already launched, and an irrevocable partial launch keeps its current hold
-or retry detail in the `LaunchTxn:` comment.
-
-### 0032-launch-transaction-node-ownership.patch
-
-This patch closes the race between planned-victim teardown and allocation of
-the intended pinned job. A transaction can reach a point where no tracked victim
-still overlaps its nodes while `select/cons_tres` or GRES cleanup continues to
-return `ESLURM_NODES_BUSY`. Retrying alone is insufficient because the main
-scheduler can allocate those freshly released nodes to another job first.
-
-Committed ordinary and heterogeneous launch transactions now register their
-exact nodes in a controller-wide ownership registry. The common run-now
-selection path hides those nodes from every non-owner while allowing the owner
-to retry its immutable plan. Ownership follows the existing transaction
-lifecycle and partial hetjob launches remain irrevocable. See
-[`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md) for the production incident,
-design alternatives, invariants, limitations, and regression matrix.
-
-### 0033-launch-transaction-reliability.patch
-
-This patch hardens launch transactions against review findings from the `0032`
-review; the ownership design is unchanged. Ordinary and hetjob plan validation
-now check planned-node health on the cheap per-iteration maintenance pass, so
-a DOWN, DRAINING/DRAINED, or FAIL planned node invalidates and releases the
-plan promptly instead of stalling the pinned retry until the safety timeout
-while healthy planned nodes sit fenced and idle. An irrevocable partial hetjob
-launch with an invalid plan is still held, but once a hold persists past five
-minutes every hold path emits a rate-limited `error()` log naming the reason
-so the wedge is operator-visible.
-
-Ordinary transactions also gain a queue-match watchdog: if backfill keeps
-scanning its queue but no record has matched the committed plan for two
-minutes (for example the owner's QOS was changed or the committed reservation
-was deleted), the plan is invalidated for replanning instead of the owner
-being silently skipped until the safety timeout. The match stamp and watchdog
-clock are taken during the same pre-cycle queue scan, so long or aborted
-backfill cycles cannot cause spurious invalidation, and job attributes are
-deliberately not compared directly because `qos_ptr`/`resv_ptr`/`resv_id` are
-per-queue-record scratch state. The queue-record match now also mirrors the
-commit path for plain `--reservation` jobs, whose committed plans previously
-could never match and always expired at the safety timeout.
-
-A successful pinned start of a job-array task clears launch-transaction state
-from the started record after `job_array_split()` reassigns job IDs, so a
-later requeue is not invisible to the main scheduler. The backfill agent
-teardown destroys the hetjob transaction list while the job write lock is
-still held, since its destructor mutates job records. Transaction lifecycle
-events now log at `info` level: opens with pinned-node and planned-victim or
-component counts, releases/invalidations/timeouts with the reason.
+The full design, invariants, operator signals, mitigation levers, and
+regression matrix are in [`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md).
+This is downstream scheduler behavior, not an upstream bug fix; upstream has
+no commit semantics for preemption and rolls back started hetjob components
+when a later component cannot start, so this is unlikely to be accepted
+upstream without substantial rework (a feature request/sponsorship
+conversation with SchedMD is the long-term path). The patch was developed and
+reviewed as a ten-patch series (`0024`-`0033`); that history is preserved on
+the `codex/job-launch-transaction-coreweave5` branch and in the pull requests
+that landed it, and the consolidated patch was verified to produce a
+byte-identical source tree.
