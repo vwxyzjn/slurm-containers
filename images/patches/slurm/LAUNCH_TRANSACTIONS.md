@@ -76,6 +76,56 @@ The registry is protected independently from scheduler thread lifecycle, but it 
 across a `slurmctld` restart. Launch transactions themselves are also in-memory state; after a
 restart, normal scheduling and stale-status cleanup resume without reconstructing an old commit.
 
+## Follow-Up Hardening
+
+Patch `0033-launch-transaction-reliability.patch` closes review findings against `0032` without
+changing the ownership design:
+
+- Ordinary and hetjob validation now check planned-node health on the cheap per-iteration
+  maintenance pass. A planned node that is DOWN, DRAINING/DRAINED, or FAIL invalidates the plan
+  promptly instead of stalling the pinned retry until the safety timeout while the remaining
+  planned nodes sit fenced and idle. DRAINING nodes previously passed validation (they leave
+  `avail_node_bitmap` but stay in `up_node_bitmap`), so a single drained node silently blocked the
+  whole plan. NOT_RESPONDING is deliberately ignored as transient.
+- For an irrevocable partial hetjob launch, an invalid plan is still held rather than released.
+  Once a hold has persisted for five minutes, every hold path emits a rate-limited `error()` log
+  (at most one per five minutes) naming the reason, including the failed node for node-health
+  holds, so a permanent wedge is not an invisible capacity leak while a transient hold that
+  resolves quickly never alarms. Cancelling the hetjob remains the operator action.
+- Ordinary transactions now carry a queue-match watchdog. The owner is only retried through queue
+  records that exactly match the plan's frozen partition, QOS, reservation, and prefer values; if
+  backfill keeps scanning its queue but no record has matched the plan for two minutes (for
+  example the job's QOS was changed or the committed reservation was deleted), the plan is
+  invalidated for replanning instead of the owner being silently skipped until the safety timeout.
+  The match stamp and the watchdog clock are both taken during the same pre-cycle queue scan, so a
+  healthy owner can never fall behind the clock however long a backfill cycle runs or wherever it
+  breaks out, and the watchdog stays dormant when backfill is not scanning (the commit timeout
+  remains the backstop). Job attributes are deliberately not compared directly, because
+  `qos_ptr`/`resv_ptr`/`resv_id` are per-queue-record scratch state rewritten by the schedulers.
+- The queue-record match now mirrors the commit path for reservations. A plain `--reservation`
+  job's queue records carry no reservation pointer, so the previous match compared the committed
+  reservation against zero and could never match: such owners were silently skipped every cycle
+  and their transactions always expired at the safety timeout. The match now falls back to the
+  job's own reservation exactly as the commit path does.
+- A successful pinned start of a job-array task no longer leaves `bf_launch_transaction` set on the
+  started record after `job_array_split()` moves the original job ID to the new pending meta
+  record. Previously a later requeue of that task was silently skipped by the main scheduler.
+- The backfill agent teardown now destroys the hetjob transaction list while the slurmctld job
+  write lock is still held; its destructor mutates job records.
+- Transaction lifecycle events now log at `info` level, so they are visible without
+  `DebugFlags=Backfill,Hetjob`: open events include pinned-node and planned-victim or component
+  counts; release, invalidation, and timeout events include the reason.
+
+## Mitigation Levers
+
+`SchedulerParameters=bf_job_commit_timeout=0` plus `scontrol reconfigure` disables new ordinary
+launch transactions and drains open ones on the next backfill cycle. Note the asymmetry:
+`bf_hetjob_commit_timeout=0` only prevents new hetjob commits; an already committed or partially
+launched hetjob transaction is not drained and must be cancelled explicitly. Rolling back the
+controller image to the `0031` stack (not lower) plus `bf_job_commit_timeout=0` is the safe
+interim mitigation if `0032`/`0033` must be reverted; a controller restart clears all in-memory
+ownership.
+
 ## Alternatives Considered
 
 ### Trust target preemption flags
@@ -158,5 +208,13 @@ Before production rollout, exercise at least these cases and inspect controller 
 | Hetjob component hits cleanup delay | Already-started components remain running; delayed component retries its exact bitmap |
 | Hetjob cancelled before any component starts | Ownership and transaction status clear |
 | Hetjob cancelled after partial launch | Remaining ownership clears without scheduler-driven rollback of started components |
-| Planned node drains or fails | Validation invalidates and releases the transaction rather than waiting forever |
+| Planned node goes DOWN, DRAINING/DRAINED, or FAIL (ordinary job) | Validation invalidates and releases the transaction promptly instead of stalling until the safety timeout |
+| Planned node goes DOWN, DRAINING/DRAINED, or FAIL (hetjob, no component started) | Validation invalidates and releases the transaction for replanning |
+| Planned node goes DOWN, DRAINING/DRAINED, or FAIL (hetjob, partial launch) | Transaction is held (irrevocable) with the failed node named in a rate-limited `error()` log until the node recovers or the hetjob is cancelled |
+| Owner QOS or reservation changed mid-transaction (`scontrol update`) | Queue-match watchdog invalidates and releases the transaction within about two minutes of backfill queue scans instead of silently skipping the owner until the safety timeout |
+| Job submitted with a QOS or reservation list (`--qos=a,b`) owns a transaction | Transaction survives main-scheduler passes over the job's other queue records; no spurious invalidation |
+| Job submitted with a plain `--reservation` owns a transaction | Owner's retries match its committed plan and it starts on the pinned nodes (previously it could never match and always expired at the safety timeout) |
+| Backfill cycle runs longer than two minutes (large `bf_max_time`) with healthy transactions | No spurious watchdog invalidation |
+| Job-array owner starts on its pinned plan | Started task carries no launch-transaction state; a later requeue of that task schedules normally |
+| `bf_job_commit_timeout=0` set via reconfigure with open transactions | New ordinary transactions stop and open ones drain on the next cycle; committed hetjob transactions require explicit cancellation |
 | Controller restart during a transaction | In-memory ownership is gone and stale `LaunchTxn:` status is cleared on backfill startup |

@@ -38,6 +38,7 @@ licenses.
   - [0030-job-launch-preempt-before-start.patch](#0030-job-launch-preempt-before-startpatch)
   - [0031-launch-transaction-status.patch](#0031-launch-transaction-statuspatch)
   - [0032-launch-transaction-node-ownership.patch](#0032-launch-transaction-node-ownershippatch)
+  - [0033-launch-transaction-reliability.patch](#0033-launch-transaction-reliabilitypatch)
 
 ### 0001-max-server-threads
 
@@ -349,3 +350,35 @@ to retry its immutable plan. Ownership follows the existing transaction
 lifecycle and partial hetjob launches remain irrevocable. See
 [`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md) for the production incident,
 design alternatives, invariants, limitations, and regression matrix.
+
+### 0033-launch-transaction-reliability.patch
+
+This patch hardens launch transactions against review findings from the `0032`
+review; the ownership design is unchanged. Ordinary and hetjob plan validation
+now check planned-node health on the cheap per-iteration maintenance pass, so
+a DOWN, DRAINING/DRAINED, or FAIL planned node invalidates and releases the
+plan promptly instead of stalling the pinned retry until the safety timeout
+while healthy planned nodes sit fenced and idle. An irrevocable partial hetjob
+launch with an invalid plan is still held, but once a hold persists past five
+minutes every hold path emits a rate-limited `error()` log naming the reason
+so the wedge is operator-visible.
+
+Ordinary transactions also gain a queue-match watchdog: if backfill keeps
+scanning its queue but no record has matched the committed plan for two
+minutes (for example the owner's QOS was changed or the committed reservation
+was deleted), the plan is invalidated for replanning instead of the owner
+being silently skipped until the safety timeout. The match stamp and watchdog
+clock are taken during the same pre-cycle queue scan, so long or aborted
+backfill cycles cannot cause spurious invalidation, and job attributes are
+deliberately not compared directly because `qos_ptr`/`resv_ptr`/`resv_id` are
+per-queue-record scratch state. The queue-record match now also mirrors the
+commit path for plain `--reservation` jobs, whose committed plans previously
+could never match and always expired at the safety timeout.
+
+A successful pinned start of a job-array task clears launch-transaction state
+from the started record after `job_array_split()` reassigns job IDs, so a
+later requeue is not invisible to the main scheduler. The backfill agent
+teardown destroys the hetjob transaction list while the job write lock is
+still held, since its destructor mutates job records. Transaction lifecycle
+events now log at `info` level: opens with pinned-node and planned-victim or
+component counts, releases/invalidations/timeouts with the reason.
