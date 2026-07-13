@@ -1,0 +1,802 @@
+diff --git a/src/slurmctld/node_scheduler.c b/src/slurmctld/node_scheduler.c
+index 44010f7..5c8fabc 100644
+--- a/src/slurmctld/node_scheduler.c
++++ b/src/slurmctld/node_scheduler.c
+@@ -128,7 +128,21 @@ typedef struct {
+ 	bitstr_t *node_bitmap;
+ } bf_launch_txn_nodes_t;
+ 
++typedef struct {
++	uint32_t job_id;
++	bool active;
++	time_t created_at;
++	uint64_t created_cycle;
++	uint64_t queue_seen_cycle;
++	uint64_t considered_cycle;
++	uint64_t attempted_cycle;
++} bf_launch_txn_handoff_t;
++
++#define BF_LAUNCH_TXN_HANDOFF_TIMEOUT 120
++
+ static list_t *bf_launch_txn_nodes = NULL;
++static list_t *bf_launch_txn_handoffs = NULL;
++static uint64_t bf_launch_txn_handoff_cycle = 0;
+ static pthread_mutex_t bf_launch_txn_nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static int  _build_node_list(job_record_t *job_ptr,
+@@ -170,6 +184,340 @@ static void _bf_launch_txn_nodes_del(void *x)
+ 	xfree(record);
+ }
+ 
++static bool _bf_launch_txn_ordinary_enabled(void)
++{
++	char *tmp_ptr;
++
++	if (!slurm_conf.schedtype ||
++	    xstrcmp(slurm_conf.schedtype, "sched/backfill"))
++		return false;
++	if ((tmp_ptr = xstrcasestr(slurm_conf.sched_params,
++				    "bf_job_commit_timeout=")) &&
++	    (atoi(tmp_ptr + strlen("bf_job_commit_timeout=")) == 0))
++		return false;
++	if ((tmp_ptr = xstrcasestr(slurm_conf.sched_params,
++				    "bf_interval=")) &&
++	    (atoi(tmp_ptr + strlen("bf_interval=")) == -1))
++		return false;
++
++	return true;
++}
++
++static bf_launch_txn_handoff_t *_bf_launch_txn_handoff_find_locked(
++	uint32_t job_id)
++{
++	bf_launch_txn_handoff_t *handoff = NULL;
++	list_itr_t *iter;
++
++	if (!bf_launch_txn_handoffs)
++		return NULL;
++
++	iter = list_iterator_create(bf_launch_txn_handoffs);
++	while ((handoff = list_next(iter))) {
++		if (handoff->job_id != job_id)
++			continue;
++		break;
++	}
++	list_iterator_destroy(iter);
++
++	return handoff;
++}
++
++static bool _bf_launch_txn_handoff_expired(
++	bf_launch_txn_handoff_t *handoff, time_t now)
++{
++	return handoff && !handoff->active &&
++		((handoff->created_at + BF_LAUNCH_TXN_HANDOFF_TIMEOUT) <= now);
++}
++
++static void _bf_launch_txn_handoff_release_locked(uint32_t job_id)
++{
++	bf_launch_txn_handoff_t *handoff;
++	list_itr_t *iter;
++
++	if (!bf_launch_txn_handoffs)
++		return;
++
++	iter = list_iterator_create(bf_launch_txn_handoffs);
++	while ((handoff = list_next(iter))) {
++		if (handoff->job_id != job_id)
++			continue;
++		list_delete_item(iter);
++		break;
++	}
++	list_iterator_destroy(iter);
++	if (!list_count(bf_launch_txn_handoffs))
++		FREE_NULL_LIST(bf_launch_txn_handoffs);
++}
++
++static void _bf_launch_txn_handoff_release(uint32_t job_id)
++{
++	if (!job_id)
++		return;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	_bf_launch_txn_handoff_release_locked(job_id);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_clear_handoffs(void)
++{
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	FREE_NULL_LIST(bf_launch_txn_handoffs);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern bool bf_launch_txn_handoff_pending(job_record_t *job_ptr)
++{
++	bf_launch_txn_handoff_t *handoff;
++	bool pending;
++
++	if (!job_ptr)
++		return false;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	handoff = _bf_launch_txn_handoff_find_locked(job_ptr->job_id);
++	if (_bf_launch_txn_handoff_expired(handoff, time(NULL))) {
++		_bf_launch_txn_handoff_release_locked(job_ptr->job_id);
++		handoff = NULL;
++	}
++	pending = handoff && handoff->active;
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++
++	return pending;
++}
++
++extern bool bf_launch_txn_handoffs_active(void)
++{
++	bf_launch_txn_handoff_t *handoff;
++	list_itr_t *iter;
++	bool active = false;
++	time_t now = time(NULL);
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (bf_launch_txn_handoffs) {
++		iter = list_iterator_create(bf_launch_txn_handoffs);
++		while ((handoff = list_next(iter))) {
++			if (_bf_launch_txn_handoff_expired(handoff, now)) {
++				list_delete_item(iter);
++				continue;
++			}
++			if (!handoff->active)
++				continue;
++			active = true;
++			break;
++		}
++		list_iterator_destroy(iter);
++		if (!list_count(bf_launch_txn_handoffs))
++			FREE_NULL_LIST(bf_launch_txn_handoffs);
++	}
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++
++	return active;
++}
++
++extern void bf_launch_txn_handoff_cycle_begin(void)
++{
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	bf_launch_txn_handoff_cycle++;
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_handoff_queue_seen(job_record_t *job_ptr)
++{
++	bf_launch_txn_handoff_t *handoff;
++
++	if (!job_ptr)
++		return;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if ((handoff = _bf_launch_txn_handoff_find_locked(job_ptr->job_id)))
++		handoff->queue_seen_cycle = bf_launch_txn_handoff_cycle;
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_handoff_queue_end(void)
++{
++	bf_launch_txn_handoff_t *handoff;
++	list_itr_t *iter;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_handoffs) {
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++
++	iter = list_iterator_create(bf_launch_txn_handoffs);
++	while ((handoff = list_next(iter))) {
++		if ((handoff->created_cycle >= bf_launch_txn_handoff_cycle) ||
++		    (handoff->queue_seen_cycle == bf_launch_txn_handoff_cycle))
++			continue;
++		info("JobId=%u launch transaction handoff released: no backfill queue record",
++		     handoff->job_id);
++		list_delete_item(iter);
++	}
++	list_iterator_destroy(iter);
++	if (!list_count(bf_launch_txn_handoffs))
++		FREE_NULL_LIST(bf_launch_txn_handoffs);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern bool bf_launch_txn_handoff_attempt(job_record_t *job_ptr)
++{
++	bf_launch_txn_handoff_t *handoff;
++	bool pending = false;
++
++	if (!job_ptr)
++		return false;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if ((handoff = _bf_launch_txn_handoff_find_locked(job_ptr->job_id)) &&
++	    handoff->active) {
++		handoff->attempted_cycle = bf_launch_txn_handoff_cycle;
++		pending = true;
++	}
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++
++	return pending;
++}
++
++extern bool bf_launch_txn_handoff_considered(job_record_t *job_ptr)
++{
++	bf_launch_txn_handoff_t *handoff;
++	bool pending = false;
++
++	if (!job_ptr)
++		return false;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if ((handoff = _bf_launch_txn_handoff_find_locked(job_ptr->job_id)) &&
++	    handoff->active) {
++		handoff->considered_cycle = bf_launch_txn_handoff_cycle;
++		pending = true;
++	}
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++
++	return pending;
++}
++
++extern void bf_launch_txn_handoff_defer_cycle(job_record_t *job_ptr)
++{
++	bf_launch_txn_handoff_t *handoff;
++
++	if (!job_ptr)
++		return;
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if ((handoff = _bf_launch_txn_handoff_find_locked(job_ptr->job_id)) &&
++	    handoff->active &&
++	    (handoff->attempted_cycle != bf_launch_txn_handoff_cycle))
++		handoff->considered_cycle = 0;
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_handoff_cycle_end(void)
++{
++	bf_launch_txn_handoff_t *handoff;
++	list_itr_t *iter;
++	time_t now = time(NULL);
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_handoffs) {
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++
++	iter = list_iterator_create(bf_launch_txn_handoffs);
++	while ((handoff = list_next(iter))) {
++		if (!handoff->active ||
++		    (handoff->considered_cycle != bf_launch_txn_handoff_cycle))
++			continue;
++		handoff->active = false;
++		handoff->created_at = now;
++		if (handoff->attempted_cycle == bf_launch_txn_handoff_cycle)
++			info("JobId=%u launch transaction handoff cooling down: selection did not commit",
++			     handoff->job_id);
++		else
++			info("JobId=%u launch transaction handoff cooling down: job became ineligible before selection",
++			     handoff->job_id);
++	}
++	list_iterator_destroy(iter);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++extern void bf_launch_txn_prune_handoffs(void)
++{
++	bf_launch_txn_handoff_t *handoff;
++	list_itr_t *iter;
++	time_t now = time(NULL);
++
++	xassert(verify_lock(JOB_LOCK, WRITE_LOCK));
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_handoffs) {
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++	if (!_bf_launch_txn_ordinary_enabled()) {
++		FREE_NULL_LIST(bf_launch_txn_handoffs);
++		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++		return;
++	}
++
++	iter = list_iterator_create(bf_launch_txn_handoffs);
++	while ((handoff = list_next(iter))) {
++		job_record_t *job_ptr = find_job_record(handoff->job_id);
++
++		if (!job_ptr || !IS_JOB_PENDING(job_ptr) ||
++		    IS_JOB_COMPLETING(job_ptr) || !job_ptr->priority ||
++		    _bf_launch_txn_handoff_expired(handoff, now))
++			list_delete_item(iter);
++	}
++	list_iterator_destroy(iter);
++	if (!list_count(bf_launch_txn_handoffs))
++		FREE_NULL_LIST(bf_launch_txn_handoffs);
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++}
++
++static bool _bf_launch_txn_should_defer_preemption(
++	job_record_t *job_ptr, uint32_t scheduler_type)
++{
++	bf_launch_txn_handoff_t *handoff;
++	bool added = false;
++
++	if (!(scheduler_type & (SLURMDB_JOB_FLAG_SUBMIT |
++				SLURMDB_JOB_FLAG_SCHED)))
++		return false;
++	if (!_bf_launch_txn_ordinary_enabled()) {
++		_bf_launch_txn_handoff_release(job_ptr->job_id);
++		return false;
++	}
++
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	handoff = _bf_launch_txn_handoff_find_locked(job_ptr->job_id);
++	if (_bf_launch_txn_handoff_expired(handoff, time(NULL))) {
++		_bf_launch_txn_handoff_release_locked(job_ptr->job_id);
++		handoff = NULL;
++	}
++	if (!handoff) {
++		handoff = xmalloc(sizeof(*handoff));
++
++		handoff->job_id = job_ptr->job_id;
++		handoff->active = true;
++		handoff->created_at = time(NULL);
++		handoff->created_cycle = bf_launch_txn_handoff_cycle;
++		if (!bf_launch_txn_handoffs)
++			bf_launch_txn_handoffs = list_create(xfree_ptr);
++		list_append(bf_launch_txn_handoffs, handoff);
++		added = true;
++	}
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++	if (added)
++		info("%pJ deferred preemption to backfill launch transaction",
++		     job_ptr);
++
++	return true;
++}
++
+ extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
+ 				       bitstr_t *usable_node_mask)
+ {
+@@ -255,6 +603,7 @@ extern void bf_launch_txn_release_nodes(uint32_t owner_id)
+ 		return;
+ 
+ 	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	_bf_launch_txn_handoff_release_locked(owner_id);
+ 	if (!bf_launch_txn_nodes) {
+ 		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
+ 		return;
+@@ -283,6 +632,7 @@ extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
+ 		return;
+ 
+ 	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	_bf_launch_txn_handoff_release_locked(owner_id);
+ 	if (!bf_launch_txn_nodes)
+ 		bf_launch_txn_nodes = list_create(_bf_launch_txn_nodes_del);
+ 
+@@ -2666,6 +3016,7 @@ extern int select_nodes(job_node_select_t *job_node_select,
+ 	list_t *gres_list_pre = NULL;
+ 	bool gres_list_pre_set = false;
+ 	job_record_t *tmp_job, *job_ptr = job_node_select->job_ptr;
++	uint32_t launch_handoff_job_id = job_ptr->job_id;
+ 
+ 	xassert(job_ptr);
+ 	xassert(job_ptr->magic == JOB_MAGIC);
+@@ -2922,7 +3273,11 @@ extern int select_nodes(job_node_select_t *job_node_select,
+ 	job_ptr->cpu_cnt = job_ptr->total_cpus;
+ 
+ 	if (!test_only && preemptee_job_list
+-	    && (error_code == SLURM_SUCCESS)) {
++	    && (error_code == SLURM_SUCCESS) &&
++	    _bf_launch_txn_should_defer_preemption(job_ptr, scheduler_type)) {
++		error_code = ESLURM_NODES_BUSY;
++	} else if (!test_only && preemptee_job_list
++		   && (error_code == SLURM_SUCCESS)) {
+ 		job_details_t *detail_ptr = job_ptr->details;
+ 		time_t now = time(NULL);
+ 		bool kill_pending = true;
+@@ -3279,6 +3634,10 @@ cleanup:
+ 		job_ptr->details->whole_node = orig_whole_node;
+ 		job_ptr->details->share_res = orig_share_res;
+ 	}
++	if (!test_only && (error_code == SLURM_SUCCESS)) {
++		_bf_launch_txn_handoff_release(launch_handoff_job_id);
++		_bf_launch_txn_handoff_release(job_ptr->job_id);
++	}
+ 
+ 	return error_code;
+ }
+diff --git a/src/slurmctld/node_scheduler.h b/src/slurmctld/node_scheduler.h
+index cfb2e52..8d1be86 100644
+--- a/src/slurmctld/node_scheduler.h
++++ b/src/slurmctld/node_scheduler.h
+@@ -131,7 +131,18 @@ extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
+ 				       bitstr_t *usable_node_mask);
+ extern void bf_launch_txn_filter_reservation_nodes(
+ 	bitstr_t *usable_node_mask);
++extern void bf_launch_txn_clear_handoffs(void);
++extern bool bf_launch_txn_handoff_attempt(job_record_t *job_ptr);
++extern bool bf_launch_txn_handoff_considered(job_record_t *job_ptr);
++extern void bf_launch_txn_handoff_cycle_begin(void);
++extern void bf_launch_txn_handoff_cycle_end(void);
++extern void bf_launch_txn_handoff_defer_cycle(job_record_t *job_ptr);
++extern bool bf_launch_txn_handoff_pending(job_record_t *job_ptr);
++extern void bf_launch_txn_handoff_queue_end(void);
++extern void bf_launch_txn_handoff_queue_seen(job_record_t *job_ptr);
++extern bool bf_launch_txn_handoffs_active(void);
+ extern bool bf_launch_txn_overlap_nodes(bitstr_t *node_bitmap);
++extern void bf_launch_txn_prune_handoffs(void);
+ extern void bf_launch_txn_release_nodes(uint32_t owner_id);
+ extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
+ 					bitstr_t *node_bitmap);
+diff --git a/src/plugins/sched/backfill/backfill.c b/src/plugins/sched/backfill/backfill.c
+index ecfa750..031bce2 100644
+--- a/src/plugins/sched/backfill/backfill.c
++++ b/src/plugins/sched/backfill/backfill.c
+@@ -69,6 +69,7 @@
+ 
+ #include "src/common/assoc_mgr.h"
+ #include "src/common/job_features.h"
++#include "src/common/job_resources.h"
+ #include "src/common/list.h"
+ #include "src/common/macros.h"
+ #include "src/common/parse_time.h"
+@@ -355,6 +356,7 @@ static void _job_launch_enter_cleanup(job_launch_t *launch,
+ static void _job_launch_filter(job_launch_t *launch,
+ 			       bitstr_t *avail_bitmap);
+ static job_launch_t *_job_launch_find(uint32_t job_id);
++static void _job_launch_handoff_sync_queue(list_t *job_queue);
+ static bool _job_launch_planned_jobs_pending(job_record_t *job_ptr,
+ 					     job_launch_t *launch);
+ static void _job_launch_promote_queue(list_t *job_queue);
+@@ -409,7 +411,7 @@ static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
+ static list_t *_het_job_select_planned_preemptee_ids(
+ 	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
+ 	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
+-	resv_exc_t *resv_exc_ptr, will_run_data_t *will_run);
++	resv_exc_t *resv_exc_ptr, int *select_rc);
+ static bool _het_job_launch_active(uint32_t het_job_id);
+ static bool _het_job_all_components_ready(het_job_map_t *map, char **reason);
+ static bool _het_job_launch_begin(het_job_map_t *map);
+@@ -1179,6 +1181,8 @@ static void _load_config(void)
+ 			bf_job_commit_timeout = BF_JOB_COMMIT_TIMEOUT;
+ 		}
+ 	}
++	if (!bf_job_commit_timeout || (backfill_interval == -1))
++		bf_launch_txn_clear_handoffs();
+ 
+ 	bf_launch_replan_delay = BF_LAUNCH_REPLAN_DELAY;
+ 	if ((tmp_ptr = xstrcasestr(sched_params,
+@@ -1338,6 +1342,7 @@ extern void __attempt_backfill(void)
+ 	FREE_NULL_LIST(job_launch_list);
+ 	FREE_NULL_LIST(het_job_list);
+ 	FREE_NULL_BITMAP(planned_bitmap);
++	bf_launch_txn_clear_handoffs();
+ }
+ 
+ /* backfill_agent - detached thread periodically attempts to backfill jobs */
+@@ -1364,6 +1369,7 @@ extern void *backfill_agent(void *args)
+ 	het_job_list = list_create(_het_job_map_del);
+ 	job_launch_list = list_create(_job_launch_del);
+ 	lock_slurmctld(all_locks);
++	bf_launch_txn_prune_handoffs();
+ 	_launch_txn_clear_stale_status();
+ 	unlock_slurmctld(all_locks);
+ 	while (!stop_backfill) {
+@@ -1387,8 +1393,10 @@ extern void *backfill_agent(void *args)
+ 		if (load_config)
+ 			_load_config();
+ 		if ((het_job_list && list_count(het_job_list)) ||
+-		    (job_launch_list && list_count(job_launch_list))) {
++		    (job_launch_list && list_count(job_launch_list)) ||
++		    bf_launch_txn_handoffs_active()) {
+ 			lock_slurmctld(all_locks);
++			bf_launch_txn_prune_handoffs();
+ 			_job_launch_clear_expired();
+ 			_het_job_start_clear(true);
+ 			unlock_slurmctld(all_locks);
+@@ -1444,6 +1452,7 @@ extern void *backfill_agent(void *args)
+ 	FREE_NULL_LIST(het_job_list);
+ 	_launch_txn_clear_stale_status();
+ 	unlock_slurmctld(all_locks);
++	bf_launch_txn_clear_handoffs();
+ 	xhash_free(user_usage_map); /* May have been init'ed if used */
+ 	FREE_NULL_BITMAP(planned_bitmap);
+ 
+@@ -2378,13 +2387,17 @@ static void _attempt_backfill(void)
+ 	_job_launch_rebuild_bitmap();
+ 	_het_job_launch_rebuild_bitmap();
+ 
++	bf_launch_txn_prune_handoffs();
++	bf_launch_txn_handoff_cycle_begin();
+ 	job_queue = build_job_queue(true, true);
++	_job_launch_handoff_sync_queue(job_queue);
+ 	job_test_count = list_count(job_queue);
+ 	if (job_test_count == 0) {
+ 		if (slurm_conf.debug_flags & DEBUG_FLAG_BACKFILL)
+ 			info("no jobs to backfill");
+ 		else
+ 			debug("no jobs to backfill");
++		bf_launch_txn_handoff_cycle_end();
+ 		FREE_NULL_LIST(job_queue);
+ 		return;
+ 	} else
+@@ -2470,6 +2483,7 @@ static void _attempt_backfill(void)
+ 	while (1) {
+ 		uint32_t bf_job_priority, prio_reserve;
+ 		bool get_boot_time = false;
++		bool launch_handoff = false;
+ 		bool licenses_unavail;
+ 		bool use_prefer = false;
+ 		slurmctld_resv_t *resv_ptr = NULL;
+@@ -2511,8 +2525,15 @@ static void _attempt_backfill(void)
+ 			break;
+ 		}
+ 
+-		if (job_test_cnt >=
+-		    max_backfill_job_cnt) {
++		job_ptr          = job_queue_rec->job_ptr;
++		part_ptr         = job_queue_rec->part_ptr;
++		bf_job_priority  = job_queue_rec->priority;
++		qos_ptr = job_queue_rec->qos_ptr;
++		use_prefer = job_queue_rec->use_prefer;
++		launch_handoff = bf_launch_txn_handoff_pending(job_ptr);
++
++		if ((job_test_cnt >= max_backfill_job_cnt) &&
++		    !launch_handoff) {
+ 			log_flag(BACKFILL, "bf_max_job_test: limit of %d reached",
+ 				 max_backfill_job_cnt);
+ 			_set_bf_exit(BF_EXIT_MAX_JOB_TEST);
+@@ -2524,11 +2545,6 @@ static void _attempt_backfill(void)
+ 			_set_bf_exit(BF_EXIT_TIMEOUT);
+ 			break;
+ 		}
+-		job_ptr          = job_queue_rec->job_ptr;
+-		part_ptr         = job_queue_rec->part_ptr;
+-		bf_job_priority  = job_queue_rec->priority;
+-		qos_ptr = job_queue_rec->qos_ptr;
+-		use_prefer = job_queue_rec->use_prefer;
+ 
+ 		if (job_ptr->array_recs &&
+ 		    (job_queue_rec->array_task_id == NO_VAL))
+@@ -2586,7 +2602,10 @@ static void _attempt_backfill(void)
+ 			if (!job_ptr)	/* All task array elements started */
+ 				continue;
+ 			job_queue_rec->job_ptr = job_ptr;
++			launch_handoff = bf_launch_txn_handoff_pending(job_ptr);
+ 		}
++		if (launch_handoff)
++			bf_launch_txn_handoff_considered(job_ptr);
+ 
+ 		job_launch = _job_launch_find(job_ptr->job_id);
+ 		if (job_launch &&
+@@ -2727,8 +2746,8 @@ static void _attempt_backfill(void)
+ 			log_flag(BACKFILL, "%pJ has a prio_reserve of %u",
+ 				 job_ptr, prio_reserve);
+ 
+-		job_no_reserve = 0;
+-		if (prio_reserve &&
++		job_no_reserve = launch_handoff ? TEST_NOW_ONLY : 0;
++		if (!launch_handoff && prio_reserve &&
+ 		    (job_ptr->priority < prio_reserve)) {
+ 			job_no_reserve = TEST_NOW_ONLY;
+ 		} else if (bf_min_age_reserve && job_ptr->details->begin_time) {
+@@ -2855,7 +2874,8 @@ next_task:
+ 			 job_ptr->resv_ptr ? job_ptr->resv_ptr->name : "NONE");
+ 
+ 		/* Test to see if we've exceeded any per user/partition limit */
+-		if (_job_exceeds_max_bf_param(job_ptr, orig_sched_start))
++		if (!launch_handoff &&
++		    _job_exceeds_max_bf_param(job_ptr, orig_sched_start))
+ 			continue;
+ 
+ 		if (((part_ptr->state_up & PARTITION_SCHED) == 0) ||
+@@ -2865,7 +2885,7 @@ next_task:
+ 			continue;
+ 		}
+ 
+-		if (!bf_licenses &&
++		if (!launch_handoff && !bf_licenses &&
+ 		    license_job_test(job_ptr, time(NULL), true)) {
+ 			log_flag(BACKFILL, "%pJ not runable now due to licenses",
+ 				 job_ptr);
+@@ -2957,6 +2977,8 @@ TRY_LATER:
+ 		     bf_max_time)) {
+ 			_set_job_time_limit(job_ptr, orig_time_limit);
+ 			_set_bf_exit(BF_EXIT_TIMEOUT);
++			if (launch_handoff)
++				bf_launch_txn_handoff_defer_cycle(job_ptr);
+ 			break;
+ 		}
+ 		test_time_count++;
+@@ -2987,6 +3009,9 @@ TRY_LATER:
+ 					 job_test_count);
+ 				state_changed_break = true;
+ 				_set_bf_exit(BF_EXIT_STATE_CHANGED);
++				if (launch_handoff)
++					bf_launch_txn_handoff_defer_cycle(
++						job_ptr);
+ 				break;
+ 			}
+ 
+@@ -3250,6 +3275,8 @@ later_start_set:
+ 		bit_not(resv_bitmap);
+ 
+ 		/* this is the time consuming operation */
++		if (launch_handoff)
++			bf_launch_txn_handoff_attempt(job_ptr);
+ 		debug2("entering _try_sched for %pJ.",
+ 		       job_ptr);
+ 
+@@ -3490,13 +3517,24 @@ later_start_set:
+ 			int rc;
+ 
+ 			if (!job_launch && bf_job_commit_timeout) {
++				int plan_rc;
+ 				list_t *planned_preemptee_job_ids;
+ 
+ 				planned_preemptee_job_ids =
+ 					_het_job_select_planned_preemptee_ids(
+ 						job_ptr, avail_bitmap, min_nodes,
+ 						max_nodes, req_nodes, &resv_exc,
+-						&will_run_data);
++						&plan_rc);
++				if (plan_rc != SLURM_SUCCESS) {
++					log_flag(BACKFILL,
++						 "%pJ pinned victim planning failed: %s",
++						 job_ptr, slurm_strerror(plan_rc));
++					FREE_NULL_LIST(planned_preemptee_job_ids);
++					_set_job_time_limit(job_ptr, orig_time_limit);
++					reservation_delete_resv_exc_parts(&resv_exc);
++					FREE_NULL_BITMAP(avail_bitmap);
++					continue;
++				}
+ 				if (planned_preemptee_job_ids &&
+ 				    list_count(planned_preemptee_job_ids)) {
+ 					job_launch = _job_launch_begin(
+@@ -3749,6 +3787,7 @@ skip_start:
+ 				continue;
+ 			}
+ 		} else if (job_ptr->het_job_id != 0) {
++			int plan_rc;
+ 			uint32_t max_time_limit;
+ 			list_t *planned_preemptee_job_ids;
+ 
+@@ -3761,7 +3800,17 @@ skip_start:
+ 				_het_job_select_planned_preemptee_ids(
+ 					job_ptr, avail_bitmap, min_nodes,
+ 					max_nodes, req_nodes, &resv_exc,
+-					&will_run_data);
++					&plan_rc);
++			if (plan_rc != SLURM_SUCCESS) {
++				log_flag(HETJOB,
++					 "%pJ pinned victim planning failed: %s",
++					 job_ptr, slurm_strerror(plan_rc));
++				FREE_NULL_LIST(planned_preemptee_job_ids);
++				_set_job_time_limit(job_ptr, orig_time_limit);
++				reservation_delete_resv_exc_parts(&resv_exc);
++				FREE_NULL_BITMAP(avail_bitmap);
++				continue;
++			}
+ 
+ 			_het_job_start_set(job_ptr, job_ptr->start_time,
+ 					   comp_time_limit, avail_bitmap,
+@@ -4044,6 +4093,7 @@ skip_start:
+ 	}
+ 	xfree(node_space);
+ 
++	bf_launch_txn_handoff_cycle_end();
+ 	FREE_NULL_LIST(job_queue);
+ 	FREE_NULL_LIST(nodes_used_list);
+ 	xfree(nodes_used);
+@@ -4551,28 +4601,46 @@ static list_t *_het_job_copy_preemptee_job_ids(list_t *preemptee_jobs)
+ static list_t *_het_job_select_planned_preemptee_ids(
+ 	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
+ 	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
+-	resv_exc_t *resv_exc_ptr, will_run_data_t *will_run)
++	resv_exc_t *resv_exc_ptr, int *select_rc)
+ {
+ 	list_t *preemptee_candidates, *preemptee_job_list = NULL;
+ 	list_t *planned_preemptee_job_ids = NULL;
++	list_t *orig_gres_list_req, *orig_gres_list_req_accum;
+ 	bitstr_t *test_bitmap;
++	job_resources_t *orig_job_resrcs;
+ 	time_t orig_start_time;
+ 	int rc;
+ 
+-	if (!job_ptr || !planned_node_bitmap)
++	xassert(select_rc);
++	*select_rc = SLURM_SUCCESS;
++	if (!job_ptr || !planned_node_bitmap) {
++		*select_rc = EINVAL;
+ 		return NULL;
++	}
+ 
+ 	preemptee_candidates = slurm_find_preemptable_jobs(job_ptr);
+-	if (!preemptee_candidates)
+-		return NULL;
+ 
+ 	test_bitmap = bit_copy(planned_node_bitmap);
+ 	orig_start_time = job_ptr->start_time;
++	orig_job_resrcs = job_ptr->job_resrcs;
++	orig_gres_list_req = job_ptr->gres_list_req;
++	orig_gres_list_req_accum = job_ptr->gres_list_req_accum;
++	job_ptr->job_resrcs = NULL;
++	job_ptr->gres_list_req = gres_job_state_list_dup(orig_gres_list_req);
++	job_ptr->gres_list_req_accum =
++		gres_job_state_list_dup(orig_gres_list_req_accum);
+ 	rc = select_g_job_test(job_ptr, test_bitmap, min_nodes, max_nodes,
+-			       req_nodes, SELECT_MODE_WILL_RUN,
++			       req_nodes, SELECT_MODE_RUN_NOW,
+ 			       preemptee_candidates, &preemptee_job_list,
+-			       resv_exc_ptr, will_run);
++			       resv_exc_ptr, NULL);
++	free_job_resources(&job_ptr->job_resrcs);
++	FREE_NULL_LIST(job_ptr->gres_list_req);
++	FREE_NULL_LIST(job_ptr->gres_list_req_accum);
++	job_ptr->job_resrcs = orig_job_resrcs;
++	job_ptr->gres_list_req = orig_gres_list_req;
++	job_ptr->gres_list_req_accum = orig_gres_list_req_accum;
+ 	job_ptr->start_time = orig_start_time;
++	*select_rc = rc;
+ 
+ 	if (rc == SLURM_SUCCESS)
+ 		planned_preemptee_job_ids =
+@@ -4608,6 +4676,8 @@ static int _job_launch_find_id(void *x, void *key)
+ 
+ static bool _launch_transactions_active(void)
+ {
++	if (bf_launch_txn_handoffs_active())
++		return true;
+ 	if (job_launch_list && list_count(job_launch_list))
+ 		return true;
+ 	if (het_job_launch_node_bitmap &&
+@@ -5012,6 +5082,20 @@ static bool _job_launch_queue_matches(job_launch_t *launch,
+ 		(launch->use_prefer == job_queue_rec->use_prefer);
+ }
+ 
++static void _job_launch_handoff_sync_queue(list_t *job_queue)
++{
++	job_queue_rec_t *job_queue_rec;
++	list_itr_t *iter;
++
++	if (job_queue) {
++		iter = list_iterator_create(job_queue);
++		while ((job_queue_rec = list_next(iter)))
++			bf_launch_txn_handoff_queue_seen(job_queue_rec->job_ptr);
++		list_iterator_destroy(iter);
++	}
++	bf_launch_txn_handoff_queue_end();
++}
++
+ static void _job_launch_promote_queue(list_t *job_queue)
+ {
+ 	list_t *promoted;
+@@ -5019,7 +5103,9 @@ static void _job_launch_promote_queue(list_t *job_queue)
+ 	job_queue_rec_t *job_queue_rec;
+ 	time_t now = time(NULL);
+ 
+-	if (!job_queue || !job_launch_list || !list_count(job_launch_list))
++	if (!job_queue ||
++	    ((!job_launch_list || !list_count(job_launch_list)) &&
++	     !bf_launch_txn_handoffs_active()))
+ 		return;
+ 
+ 	promoted = list_create(NULL);
+@@ -5031,6 +5117,9 @@ static void _job_launch_promote_queue(list_t *job_queue)
+ 						       job_queue_rec)) {
+ 			launch->last_queue_match = now;
+ 			list_append(promoted, list_remove(iter));
++		} else if (bf_launch_txn_handoff_pending(
++				   job_queue_rec->job_ptr)) {
++			list_append(promoted, list_remove(iter));
+ 		}
+ 	}
+ 	list_iterator_destroy(iter);

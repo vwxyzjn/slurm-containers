@@ -38,6 +38,9 @@ licenses.
   - [0030-job-launch-preempt-before-start.patch](#0030-job-launch-preempt-before-startpatch)
   - [0031-launch-transaction-status.patch](#0031-launch-transaction-statuspatch)
   - [0032-launch-transaction-node-ownership.patch](#0032-launch-transaction-node-ownershippatch)
+  - [0033-launch-transaction-reliability.patch](#0033-launch-transaction-reliabilitypatch)
+  - [0034-launch-transaction-bounded-replan.patch](#0034-launch-transaction-bounded-replanpatch)
+  - [0035-launch-transaction-minimal-victims.patch](#0035-launch-transaction-minimal-victimspatch)
 
 ### 0001-max-server-threads
 
@@ -349,3 +352,119 @@ to retry its immutable plan. Ownership follows the existing transaction
 lifecycle and partial hetjob launches remain irrevocable. See
 [`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md) for the production incident,
 design alternatives, invariants, limitations, and regression matrix.
+
+### 0033-launch-transaction-reliability.patch
+
+This patch hardens launch transactions against review findings from the `0032`
+review; the ownership design is unchanged. Ordinary and hetjob plan validation
+now check planned-node health on the cheap per-iteration maintenance pass, so
+a DOWN, DRAINING/DRAINED, or FAIL planned node invalidates and releases the
+plan promptly instead of stalling the pinned retry until the safety timeout
+while healthy planned nodes sit fenced and idle. An irrevocable partial hetjob
+launch with an invalid plan is still held, but once a hold persists past five
+minutes every hold path emits a rate-limited `error()` log naming the reason
+so the wedge is operator-visible.
+
+Ordinary transactions also gain a queue-match watchdog: if backfill keeps
+scanning its queue but no record has matched the committed plan for two
+minutes (for example the owner's QOS was changed or the committed reservation
+was deleted), the plan is invalidated for replanning instead of the owner
+being silently skipped until the safety timeout. The match stamp and watchdog
+clock are taken during the same pre-cycle queue scan, so long or aborted
+backfill cycles cannot cause spurious invalidation, and job attributes are
+deliberately not compared directly because `qos_ptr`/`resv_ptr`/`resv_id` are
+per-queue-record scratch state. The queue-record match now also mirrors the
+commit path for plain `--reservation` jobs, whose committed plans previously
+could never match and always expired at the safety timeout.
+
+A successful pinned start of a job-array task clears launch-transaction state
+from the started record after `job_array_split()` reassigns job IDs, so a
+later requeue is not invisible to the main scheduler. The backfill agent
+teardown destroys the hetjob transaction list while the job write lock is
+still held, since its destructor mutates job records. Transaction lifecycle
+events now log at `info` level: opens with pinned-node and planned-victim or
+component counts, releases/invalidations/timeouts with the reason.
+
+### 0034-launch-transaction-bounded-replan.patch
+
+This patch prevents a failed committed plan from immediately selecting and
+preempting a replacement victim set. Once any planned victim has entered
+preemption, an invalid or timed-out ordinary or not-yet-started heterogeneous
+transaction first enters a cleanup state. It keeps the original node fence,
+waits without sending any new preemption requests, and releases the fence only
+after the original victims have left. The owner then waits a configurable
+cooldown before one bounded replacement plan is allowed. A second failed
+victim plan is blocked for operator review instead of creating an unbounded
+preemption storm. Defaults are
+`SchedulerParameters=bf_launch_replan_delay=300,bf_launch_max_replans=1`.
+
+Non-`ESLURM_NODES_BUSY` start errors no longer discard a valid committed plan
+mid-grace. The scheduler retains the exact nodes and victims and retries that
+same start every five seconds until it succeeds, validation fails, or the
+existing commit safety timeout expires. This does not change QOS preemption
+semantics: `slurm_job_preempt()` remains authoritative, so a configured
+five-minute `GraceTime` is neither hardcoded nor shortened by this patch.
+
+Before a heterogeneous launch allocates its first component, every remaining
+component must pass an exact `SELECT_MODE_RUN_NOW` check on its pinned bitmap
+with no replacement preemptee candidates. This closes the common resource and
+GRES race where one component started while another was already unable to
+allocate. Components are still launched sequentially after the barrier, so a
+hardware failure in that final interval remains possible. If any component has
+already started, the launch stays irrevocable and visible; Slurm never rolls
+back the running component automatically.
+
+Finally, reservation creation, resource-changing reservation updates, and
+automatic reservation node selection now exclude nodes owned by active launch
+transactions, including `MAINT` and `OVERLAP` placement. The short-lived launch
+commit wins; an operator can cancel the owner before placing an emergency
+reservation on those exact nodes. Retry and block state is controller-local
+and is cleared with stale transaction status when the backfill agent restarts.
+
+### 0035-launch-transaction-minimal-victims.patch
+
+This patch prevents a small job on a consumable-resource node from preempting
+every preemptible job resident on that node. The transaction planner previously
+used `SELECT_MODE_WILL_RUN` to reconstruct victims for an already-selected
+bitmap. In `select/cons_tres`, that mode returns every preemptible candidate
+overlapping the selected nodes. A four-CPU job therefore selected 32 six-CPU
+victims and disrupted all 192 CPUs on one shared node.
+
+Pinned victim reconstruction now uses Slurm's existing
+`SELECT_MODE_RUN_NOW` preemption simulation. That algorithm removes candidates
+until the request fits and returns the sufficient victim prefix selected by
+Slurm's normal run-now ordering. The helper detaches any existing
+`job_resrcs`, copies the resulting victim IDs, discards the simulated
+allocation, and restores the original pointer. It never allocates nodes or
+signals victims during planning. The simulator also runs against temporary
+copies of the job's GRES request state so a GPU selection cannot leak into the
+pending job record.
+
+The patch also prevents two schedulers from initiating independent plans for
+the same ordinary job. When submit-time or main-scheduler allocation finds that
+a job needs preemption, it records a per-job handoff and returns nodes busy
+without signaling preemptees. Backfill promotes handoff jobs ahead of its
+normal scan limits and evaluates them for immediate launch even when ordinary
+per-user or license scan filters would have skipped them. Backfill then
+selects, registers, and signals the single committed plan.
+
+A handoff grants one prompt backfill attempt rather than creating an unbounded
+retry loop. Backfill drops it if the owner has no queue record, is held, or is
+no longer pending. Once a promoted record passes cycle-wide budget and yield
+checks, either a job-specific eligibility rejection or a selection that does
+not open a transaction moves the marker into a non-active 120-second cooldown.
+Submit-time and main scheduling still cannot signal a competing victim set,
+but the marker does not force one-second backfill cycles. Records deferred by
+cycle-wide limits retain their active handoff until they receive that first
+job-specific consideration, and handoffs created while backfill temporarily
+yields survive until the next queue scan.
+
+The handoff is enabled directly from the live scheduler configuration only
+while ordinary launch transactions and `sched/backfill` are enabled. A failed
+run-now victim simulation is returned separately from an empty victim list, so
+neither ordinary jobs nor hetjob components can fall through to an uncommitted
+start attempt; its handoff enters cooldown after that backfill attempt, and a
+fresh active handoff cannot be created until the cooldown marker expires.
+Setting `bf_job_commit_timeout=0` restores the legacy
+non-transactional preemption path. QOS `GraceTime` remains authoritative after
+the transaction signals its selected victims.
