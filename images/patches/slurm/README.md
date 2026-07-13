@@ -26,6 +26,10 @@ licenses.
   - [0016-scontrol-dashboards](#0016-scontrol-dashboards)
   - [0019-empty-pids-retry](#0019-empty-pids-retry)
   - [0020-empty-topology](#0020-empty-topology)
+  - [0021-revert-remove-cg-limits.patch](#0021-revert-remove-cg-limitspatch)
+  - [0022-move-persist-conn-shutdown.patch](#0022-move-persist-conn-shutdownpatch)
+  - [0023-fail-bad-constraints.patch](#0023-fail-bad-constraintspatch)
+  - [0024-launch-transactions.patch](#0024-launch-transactionspatch)
 
 ### 0001-max-server-threads
 
@@ -204,3 +208,52 @@ Notes from `pthead_detch` man
 In SLURM when a job fails due to not being able to meet the segment size requirements, the reason is `FAIL_BAD_CONSTRAINTS`. When a job is in this state, it is set to priority = 0, which is a held state. The scheduler will skip evaluating the job on future runs.
 
 This patch is to change it so that jobs that fail for unmet segment size requirements to not hold the job. So that if there are topology changes to the cluster, that can satisfy the job requirements, the job can still schedule. This will set the job reason to `Reason=Resources` instead of `Reason=BadConstraints`.
+
+### 0024-launch-transactions.patch
+
+This patch gives preemption commit semantics ("launch transactions") for both
+ordinary and heterogeneous jobs. Without it, backfill can select a node set,
+initiate victim preemption, and then lose the freed capacity to another job
+while victims observe their QOS grace time and node/GRES cleanup completes --
+repeated replanning can then preempt fresh victim sets without forward
+progress (a preemption storm; see the 2026-07-13 production incident with job
+`2131756` in [`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md)).
+
+With this patch, backfill commits one exact node and victim plan before
+signaling any victim, honors QOS grace normally, registers the pinned nodes in
+a controller-wide ownership registry (an owner-exempt filter in the common
+node-selection path that every run-now allocation traverses), retries the
+exact plan on `ESLURM_NODES_BUSY` through victim exit and cleanup, and
+releases on validation failure, cancellation, terminal state, or the safety
+timeout. Validation covers planned-node health (DOWN/DRAINING/FAIL), a
+queue-match watchdog for commit-attribute drift (for example a QOS change on
+the owner), and unplanned occupants. Once any hetjob component starts, the
+transaction is irrevocable: started components are never rolled back, and a
+held partial launch emits a rate-limited `error()` once it persists. Pending
+owners report `Reason=PreemptionPlanned/Preempting/HetjobPartialLaunch` with
+detailed timing in a namespaced `LaunchTxn:` `SystemComment`.
+
+Planned victim lists are pruned to a prefix-minimal set before commit (the
+select plugin's will-run preemptee list is overlap-based and would otherwise
+plan every preemptible job on a shared node as a victim), and single-node
+ordinary plans that would share their node with non-victim jobs fall back to
+plain preempt-on-start instead of fencing the whole node; hetjobs and
+multi-node plans always keep transactions.
+
+New `SchedulerParameters`: `bf_hetjob_commit_timeout` and
+`bf_job_commit_timeout` (seconds a validated transaction may be held while
+planned preemptions clear; default 1800; `0` disables new transactions and
+drains open ordinary ones -- an already committed or partially launched hetjob
+transaction must be cancelled explicitly).
+
+The full design, invariants, operator signals, mitigation levers, and
+regression matrix are in [`LAUNCH_TRANSACTIONS.md`](LAUNCH_TRANSACTIONS.md).
+This is downstream scheduler behavior, not an upstream bug fix; upstream has
+no commit semantics for preemption and rolls back started hetjob components
+when a later component cannot start, so this is unlikely to be accepted
+upstream without substantial rework (a feature request/sponsorship
+conversation with SchedMD is the long-term path). The patch was developed and
+reviewed as a ten-patch series (`0024`-`0033`); that history is preserved on
+the `codex/job-launch-transaction-coreweave5` branch and in the pull requests
+that landed it, and the consolidated patch was verified to produce a
+byte-identical source tree.
