@@ -1,0 +1,494 @@
+--- a/src/plugins/sched/backfill/backfill.c
++++ b/src/plugins/sched/backfill/backfill.c
+@@ -128,6 +128,7 @@
+ #define MAX_MAX_RPC_CNT                1000
+ #define MAX_YIELD_RPC_CNT 200
+ #define MAX_YIELD_SLEEP                10000000 /* 10 seconds in usec */
++#define LAUNCH_TXN_SYSTEM_COMMENT_PREFIX "LaunchTxn: "
+ 
+ #define MAX_BF_MAX_JOB_ASSOC           MAX_BF_MAX_JOB_TEST
+ #define MAX_BF_MAX_JOB_USER            MAX_BF_MAX_JOB_TEST
+@@ -183,6 +184,14 @@
+ 	list_t *planned_preemptee_job_ids;
+ } job_launch_t;
+ 
++typedef struct {
++	uint32_t blocker_count;
++	uint32_t uninitiated_count;
++	time_t grace_deadline;
++	time_t grace_duration;
++	list_t *blocker_job_ids;
++} launch_preempt_status_t;
++
+ typedef enum {
+ 	HET_START_OK = SLURM_SUCCESS,
+ 	HET_START_FAILED = SLURM_ERROR,
+@@ -317,6 +326,19 @@
+ static void _job_launch_rebuild_bitmap(void);
+ static void _job_launch_set_state(job_record_t *job_ptr,
+ 				  const char *state_desc);
++static void _job_launch_update_status(job_record_t *job_ptr,
++				      job_launch_t *launch, time_t now);
++static void _launch_txn_add_preempt_status(
++	launch_preempt_status_t *status, job_record_t *preemptor,
++	bitstr_t *planned_node_bitmap, list_t *planned_preemptee_job_ids,
++	time_t now);
++static bool _launch_txn_clear_status(job_record_t *job_ptr);
++static void _launch_txn_clear_stale_status(void);
++static char *_launch_txn_make_system_comment(
++	launch_preempt_status_t *status, time_t now, time_t launch_start,
++	int commit_timeout, bool irrevocable);
++static void _launch_txn_set_system_comment(job_record_t *job_ptr,
++					   const char *comment);
+ static bool _launch_transactions_active(void);
+ static bool _job_part_valid(job_record_t *job_ptr, part_record_t *part_ptr);
+ static void _load_config(void);
+@@ -330,6 +352,9 @@
+ static bool _het_job_id_in_list(list_t *job_id_list, uint32_t job_id);
+ static bool _het_job_job_on_planned_nodes(bitstr_t *planned_node_bitmap,
+ 					  job_record_t *job_ptr);
++static void _het_job_clear_launch_status(het_job_map_t *map);
++static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
++					  const char *detail);
+ static list_t *_het_job_select_planned_preemptee_ids(
+ 	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
+ 	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
+@@ -1256,6 +1281,9 @@
+ 	_init_planned_bitmap();
+ 	het_job_list = list_create(_het_job_map_del);
+ 	job_launch_list = list_create(_job_launch_del);
++	lock_slurmctld(all_locks);
++	_launch_txn_clear_stale_status();
++	unlock_slurmctld(all_locks);
+ 	while (!stop_backfill) {
+ 		if (short_sleep)
+ 			_my_sleep(USEC_IN_SEC);
+@@ -3418,15 +3446,8 @@
+ 					   (launch_preemption_pending ||
+ 					    _job_launch_preempt_planned_jobs(
+ 						    job_ptr, job_launch))) {
+-					char *state_desc = NULL;
+-
+-					xstrfmtcat(state_desc,
+-						   "Launch transaction: waiting for planned preemptions to clear, %ld/%d seconds",
+-						   (long) (now -
+-							   job_launch->launch_start),
+-						   bf_job_commit_timeout);
+-					_job_launch_set_state(job_ptr, state_desc);
+-					xfree(state_desc);
++					_job_launch_update_status(job_ptr, job_launch,
++							  now);
+ 				} else {
+ 					_job_launch_clear(job_launch,
+ 							  slurm_strerror(rc));
+@@ -4464,6 +4485,190 @@
+ 		return NULL;
+ 
+ 	return list_find_first(job_launch_list, _job_launch_find_id, &job_id);
++}
++
++static bool _launch_txn_clear_status(job_record_t *job_ptr)
++{
++	bool changed = false;
++
++	if (!job_ptr)
++		return false;
++
++	if (job_ptr->system_comment &&
++	    !xstrncmp(job_ptr->system_comment,
++		      LAUNCH_TXN_SYSTEM_COMMENT_PREFIX,
++		      strlen(LAUNCH_TXN_SYSTEM_COMMENT_PREFIX))) {
++		xfree(job_ptr->system_comment);
++		changed = true;
++	}
++	if (IS_JOB_PENDING(job_ptr) &&
++	    (!xstrcmp(job_ptr->state_desc, "PreemptionPlanned") ||
++	     !xstrcmp(job_ptr->state_desc, "Preempting") ||
++	     !xstrcmp(job_ptr->state_desc, "HetjobPartialLaunch"))) {
++		xfree(job_ptr->state_desc);
++		job_ptr->state_reason = WAIT_RESOURCES;
++		changed = true;
++	}
++	if (changed)
++		last_job_update = time(NULL);
++
++	return changed;
++}
++
++static void _launch_txn_clear_stale_status(void)
++{
++	job_record_t *job_ptr;
++	list_itr_t *iter;
++	uint32_t cleared = 0;
++
++	if (!job_list)
++		return;
++
++	iter = list_iterator_create(job_list);
++	while ((job_ptr = list_next(iter)))
++		if (_launch_txn_clear_status(job_ptr))
++			cleared++;
++	list_iterator_destroy(iter);
++
++	if (cleared)
++		log_flag(BACKFILL,
++			 "Cleared %u stale launch transaction statuses",
++			 cleared);
++}
++
++static void _launch_txn_set_system_comment(job_record_t *job_ptr,
++					   const char *comment)
++{
++	if (!job_ptr || !comment)
++		return;
++	if (job_ptr->system_comment &&
++	    xstrncmp(job_ptr->system_comment,
++		     LAUNCH_TXN_SYSTEM_COMMENT_PREFIX,
++		     strlen(LAUNCH_TXN_SYSTEM_COMMENT_PREFIX)))
++		return;
++	if (!xstrcmp(job_ptr->system_comment, comment))
++		return;
++
++	xfree(job_ptr->system_comment);
++	job_ptr->system_comment = xstrdup(comment);
++	last_job_update = time(NULL);
++}
++
++static void _launch_txn_add_preempt_status(
++	launch_preempt_status_t *status, job_record_t *preemptor,
++	bitstr_t *planned_node_bitmap, list_t *planned_preemptee_job_ids,
++	time_t now)
++{
++	list_itr_t *iter;
++	uint32_t *job_id;
++
++	if (!status || !preemptor || !planned_node_bitmap ||
++	    !planned_preemptee_job_ids)
++		return;
++
++	iter = list_iterator_create(planned_preemptee_job_ids);
++	while ((job_id = list_next(iter))) {
++		job_record_t *preemptee = find_job_record(*job_id);
++		time_t grace_duration;
++
++		if (!preemptee)
++			continue;
++		if (_het_job_id_in_list(status->blocker_job_ids, *job_id))
++			continue;
++		if (!job_overlap_and_running(planned_node_bitmap,
++					     preemptor->license_list,
++					     preemptee) &&
++		    !(IS_JOB_COMPLETING(preemptee) &&
++		      _het_job_job_on_planned_nodes(planned_node_bitmap,
++						    preemptee)))
++			continue;
++
++		_het_job_append_job_id(&status->blocker_job_ids, *job_id);
++		status->blocker_count++;
++		if (!preemptee->preempt_time && !IS_JOB_COMPLETING(preemptee)) {
++			status->uninitiated_count++;
++			continue;
++		}
++		if (!preemptee->preempt_time ||
++		    !(preemptee->bit_flags & GRACE_PREEMPT) ||
++		    (preemptee->end_time <= now))
++			continue;
++
++		grace_duration = MAX(0, preemptee->end_time -
++					 preemptee->preempt_time);
++		if ((preemptee->end_time > status->grace_deadline) ||
++		    ((preemptee->end_time == status->grace_deadline) &&
++		     (grace_duration > status->grace_duration))) {
++			status->grace_deadline = preemptee->end_time;
++			status->grace_duration = grace_duration;
++		}
++	}
++	list_iterator_destroy(iter);
++}
++
++static char *_launch_txn_make_system_comment(
++	launch_preempt_status_t *status, time_t now, time_t launch_start,
++	int commit_timeout, bool irrevocable)
++{
++	char grace_remaining[32], grace_total[32], safety_deadline[32];
++	char *comment = NULL;
++
++	if (!status)
++		return NULL;
++
++	if (irrevocable && !status->blocker_count) {
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++			   "partial launch committed; waiting for remaining components; no automatic timeout");
++	} else if (status->blocker_count &&
++		   (status->uninitiated_count == status->blocker_count)) {
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++			   "%u blocker%s; preemption planned",
++			   status->blocker_count,
++			   (status->blocker_count == 1) ? "" : "s");
++	} else if (status->uninitiated_count) {
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++			   "%u blocker%s; %u preemption%s not yet started",
++			   status->blocker_count,
++			   (status->blocker_count == 1) ? "" : "s",
++			   status->uninitiated_count,
++			   (status->uninitiated_count == 1) ? "" : "s");
++	} else if (status->grace_deadline > now) {
++		secs2time_str(status->grace_deadline - now,
++			      grace_remaining, sizeof(grace_remaining));
++		secs2time_str(status->grace_duration,
++			      grace_total, sizeof(grace_total));
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++			   "%u blocker%s; grace %s remaining of %s",
++			   status->blocker_count,
++			   (status->blocker_count == 1) ? "" : "s",
++			   grace_remaining, grace_total);
++	} else if (status->blocker_count) {
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX
++			   "grace elapsed; waiting for %u job%s to release resources",
++			   status->blocker_count,
++			   (status->blocker_count == 1) ? "" : "s");
++	} else {
++		xstrfmtcat(comment,
++			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX "pinned plan ready");
++	}
++
++	if (irrevocable) {
++		if (status->blocker_count)
++			xstrcat(comment, "; partial launch irrevocable");
++	} else if (launch_start && commit_timeout) {
++		time_t deadline = launch_start + commit_timeout;
++
++		slurm_make_time_str(&deadline, safety_deadline,
++				    sizeof(safety_deadline));
++		xstrfmtcat(comment, "; safety deadline %s", safety_deadline);
++	}
++
++	return comment;
+ }
+ 
+ static void _job_launch_del(void *x)
+@@ -4475,8 +4680,10 @@
+ 		return;
+ 
+ 	job_ptr = find_job_record(launch->job_id);
+-	if (job_ptr)
++	if (job_ptr) {
++		_launch_txn_clear_status(job_ptr);
+ 		job_ptr->bf_launch_transaction = false;
++	}
+ 	xfree(launch->part_name);
+ 	FREE_NULL_BITMAP(launch->planned_node_bitmap);
+ 	FREE_NULL_LIST(launch->planned_resident_job_ids);
+@@ -4494,6 +4701,29 @@
+ 	job_ptr->state_desc = xstrdup(state_desc);
+ 	job_ptr->state_reason = WAIT_RESOURCES;
+ 	last_job_update = time(NULL);
++}
++
++static void _job_launch_update_status(job_record_t *job_ptr,
++				      job_launch_t *launch, time_t now)
++{
++	launch_preempt_status_t status = { 0 };
++	char *comment;
++
++	if (!job_ptr || !launch)
++		return;
++
++	_launch_txn_add_preempt_status(&status, job_ptr,
++				       launch->planned_node_bitmap,
++				       launch->planned_preemptee_job_ids, now);
++	_job_launch_set_state(job_ptr,
++			      (status.blocker_count &&
++			       !status.uninitiated_count) ?
++			      "Preempting" : "PreemptionPlanned");
++	comment = _launch_txn_make_system_comment(
++		&status, now, launch->launch_start, bf_job_commit_timeout, false);
++	_launch_txn_set_system_comment(job_ptr, comment);
++	xfree(comment);
++	FREE_NULL_LIST(status.blocker_job_ids);
+ }
+ 
+ static void _job_launch_rebuild_bitmap(void)
+@@ -4654,7 +4884,6 @@
+ 	list_t *planned_preemptee_job_ids)
+ {
+ 	job_launch_t *launch;
+-	char *state_desc = NULL;
+ 
+ 	if (!bf_job_commit_timeout || !job_ptr || job_ptr->het_job_id ||
+ 	    !part_ptr || !planned_node_bitmap ||
+@@ -4688,11 +4917,7 @@
+ 	list_append(job_launch_list, launch);
+ 	_job_launch_rebuild_bitmap();
+ 
+-	xstrfmtcat(state_desc,
+-		   "Launch transaction: waiting for planned preemptions to clear, 0/%d seconds",
+-		   bf_job_commit_timeout);
+-	_job_launch_set_state(job_ptr, state_desc);
+-	xfree(state_desc);
++	_job_launch_update_status(job_ptr, launch, launch->launch_start);
+ 	log_flag(BACKFILL, "%pJ opened launch transaction for pinned nodes",
+ 		 job_ptr);
+ 
+@@ -4887,27 +5112,82 @@
+ 	last_job_update = time(NULL);
+ }
+ 
+-static void _het_job_set_launch_wait_state(het_job_map_t *map, time_t now)
++static void _het_job_clear_launch_status(het_job_map_t *map)
+ {
+-	char *state_desc = NULL;
++	het_job_rec_t *rec;
++	list_itr_t *iter;
+ 
+-	if (!map || (map->launch_state != HET_LAUNCH_COMMITTED))
++	if (!map)
+ 		return;
+ 
+-	if (_het_job_latch_started_components(map)) {
+-		xstrfmtcat(state_desc,
+-			   "Hetjob partial launch committed: waiting for remaining components to acquire pinned nodes, %ld seconds elapsed",
+-			   (long) MAX(0, now - map->launch_start));
+-	} else {
+-		xstrfmtcat(state_desc,
+-			   "Hetjob launch transaction: waiting for planned preemptions to clear, %ld/%d seconds",
+-			   (long) MAX(0, now - map->launch_start),
+-			   bf_hetjob_commit_timeout);
++	iter = list_iterator_create(map->het_job_rec_list);
++	while ((rec = list_next(iter))) {
++		job_record_t *job_ptr = _het_job_rec_job_ptr(map, rec);
++
++		_launch_txn_clear_status(job_ptr);
+ 	}
+-	_het_job_set_state_desc(map, state_desc);
+-	xfree(state_desc);
++	list_iterator_destroy(iter);
+ }
+ 
++static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
++					  const char *detail)
++{
++	launch_preempt_status_t status = { 0 };
++	het_job_rec_t *rec;
++	list_itr_t *iter;
++	char *comment;
++	bool irrevocable;
++
++	if (!map || (map->launch_state != HET_LAUNCH_COMMITTED))
++		return;
++
++	irrevocable = _het_job_latch_started_components(map);
++	iter = list_iterator_create(map->het_job_rec_list);
++	while ((rec = list_next(iter))) {
++		job_record_t *job_ptr = _het_job_rec_job_ptr(map, rec);
++
++		if (rec->launch_started)
++			continue;
++		_launch_txn_add_preempt_status(
++			&status, job_ptr, rec->planned_node_bitmap,
++			rec->planned_preemptee_job_ids, now);
++	}
++	list_iterator_destroy(iter);
++
++	if (status.blocker_count) {
++		_het_job_set_state_desc(map, status.uninitiated_count ?
++					"PreemptionPlanned" : "Preempting");
++	} else if (irrevocable) {
++		_het_job_set_state_desc(map, "HetjobPartialLaunch");
++	} else {
++		_het_job_set_state_desc(map, "PreemptionPlanned");
++	}
++
++	comment = _launch_txn_make_system_comment(
++		&status, now, map->launch_start, bf_hetjob_commit_timeout,
++		irrevocable);
++	if (detail && detail[0])
++		xstrfmtcat(comment, "; detail: %s", detail);
++	iter = list_iterator_create(map->het_job_rec_list);
++	while ((rec = list_next(iter))) {
++		job_record_t *job_ptr = _het_job_rec_job_ptr(map, rec);
++
++		if (job_ptr && !IS_JOB_FINISHED(job_ptr))
++			_launch_txn_set_system_comment(job_ptr, comment);
++	}
++	list_iterator_destroy(iter);
++	xfree(comment);
++	FREE_NULL_LIST(status.blocker_job_ids);
++}
++
++static void _het_job_set_launch_wait_state(het_job_map_t *map, time_t now)
++{
++	if (!map || (map->launch_state != HET_LAUNCH_COMMITTED))
++		return;
++
++	_het_job_update_launch_status(map, now, NULL);
++}
++
+ static bitstr_t *_het_job_launch_build_bitmap(het_job_map_t *map)
+ {
+ 	het_job_rec_t *rec;
+@@ -5100,21 +5380,15 @@
+ static bool _het_job_hold_partial_launch(het_job_map_t *map,
+ 					 const char *reason)
+ {
+-	char *state_desc = NULL;
+-
+ 	if (!_het_job_latch_started_components(map) ||
+ 	    _het_job_launch_cannot_continue(map))
+ 		return false;
+ 
+-	xstrfmtcat(state_desc,
+-		   "Hetjob partial launch committed: waiting for remaining components%s%s",
+-		   reason ? ": " : "", reason ? reason : "");
+-	_het_job_set_state_desc(map, state_desc);
++	_het_job_update_launch_status(map, time(NULL), reason);
+ 	log_flag(HETJOB,
+ 		 "Hetjob %u partial launch remains committed: %s",
+ 		 map->het_job_id, reason ? reason : "retrying remaining components");
+ 	map->prev_start = time(NULL) + 1;
+-	xfree(state_desc);
+ 	return true;
+ }
+ 
+@@ -5134,8 +5408,12 @@
+ 	map->launch_irrevocable = false;
+ 	map->launch_start = 0;
+ 	iter = list_iterator_create(map->het_job_rec_list);
+-	while ((rec = list_next(iter)))
++	while ((rec = list_next(iter))) {
++		job_record_t *job_ptr = _het_job_rec_job_ptr(map, rec);
++
++		_launch_txn_clear_status(job_ptr);
+ 		rec->launch_started = false;
++	}
+ 	list_iterator_destroy(iter);
+ 	if (rebuild_bitmap)
+ 		_het_job_launch_rebuild_bitmap();
+@@ -5303,11 +5581,7 @@
+ 	map->launch_start = now;
+ 	_het_job_launch_rebuild_bitmap();
+ 
+-	xstrfmtcat(state_desc,
+-		   "Hetjob launch transaction: waiting for planned preemptions to clear, 0/%d seconds",
+-		   bf_hetjob_commit_timeout);
+-	_het_job_set_state_desc(map, state_desc);
+-	xfree(state_desc);
++	_het_job_update_launch_status(map, now, NULL);
+ 
+ 	log_flag(HETJOB, "Hetjob %u launch transaction opened for planned nodes",
+ 		 map->het_job_id);
+@@ -5321,6 +5595,8 @@
+ static void _het_job_map_del(void *x)
+ {
+ 	het_job_map_t *map = (het_job_map_t *) x;
++
++	_het_job_clear_launch_status(map);
+ 	FREE_NULL_LIST(map->het_job_rec_list);
+ 	xfree(map);
+ }
+
