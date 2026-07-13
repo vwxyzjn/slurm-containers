@@ -233,6 +233,13 @@ held partial launch emits a rate-limited `error()` once it persists. Pending
 owners report `Reason=PreemptionPlanned/Preempting/HetjobPartialLaunch` with
 detailed timing in a namespaced `LaunchTxn:` `SystemComment`.
 
+Planned victim lists are pruned to a prefix-minimal set before commit (the
+select plugin's will-run preemptee list is overlap-based and would otherwise
+plan every preemptible job on a shared node as a victim), and single-node
+ordinary plans that would share their node with non-victim jobs fall back to
+plain preempt-on-start instead of fencing the whole node; hetjobs and
+multi-node plans always keep transactions.
+
 New `SchedulerParameters`: `bf_hetjob_commit_timeout` and
 `bf_job_commit_timeout` (seconds a validated transaction may be held while
 planned preemptions clear; default 1800; `0` disables new transactions and

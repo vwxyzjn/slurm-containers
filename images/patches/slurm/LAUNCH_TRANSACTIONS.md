@@ -127,6 +127,44 @@ changing the ownership design:
   `DebugFlags=Backfill,Hetjob`: open events include pinned-node and planned-victim or component
   counts; release, invalidation, and timeout events include the reason.
 
+## Shared Nodes And Victim Pruning
+
+A second production incident (2026-07-13, job `2135825`) showed the transaction machinery
+over-preempting on shared partitions: a 4-CPU job on a fully packed 192-core `turin-cpu-shared`
+node planned and signaled roughly thirty 6-CPU preemptible tasks — the node's entire preemptible
+population — when a single victim would have freed enough capacity.
+
+Two root causes:
+
+1. Planned victims come from a `SELECT_MODE_WILL_RUN` test, and the select plugin's will-run
+   preemptee list is every preemptable candidate whose nodes overlap the selection, with no
+   minimal-subset pruning. On whole-node plans (the GPU fleet) overlap is minimal; on a shared
+   node it is everything.
+2. The ownership fence is node-granular, so a small single-node plan fenced the entire shared
+   node from every other scheduling path for the transaction's lifetime.
+
+Both are now addressed:
+
+- **Prefix-minimal victim pruning.** After the will-run test, the planned victim list is reduced
+  to the shortest prefix, in the list's existing preemption-priority order, that still lets the
+  job start now. When every victim is needed (whole-node plans) this costs one extra select
+  probe; otherwise a binary search over prefix length, O(log victims) probes. Probes bound the
+  will-run window at now, so an insufficient prefix rejects without simulating the future
+  job-completion timeline. The cost recurs each backfill cycle while an uncommitted plan is
+  re-planned (pending hetjob components; a gated shared-node job that has not started yet).
+  Pruning is skipped for plans with a flexible node count (`min_nodes != max_nodes` across
+  multiple nodes), where a probe could validate a smaller placement than the committed one.
+  Pruned ex-victims remain on the plan's resident whitelist, so validation does not treat them
+  as unplanned blockers. Pruning applies to ordinary and hetjob plans alike.
+- **Single-node shared ordinary plans do not open transactions.** If a one-node ordinary plan
+  would still share its node with running or suspended jobs that are not planned victims, the
+  job starts through plain preempt-on-start (upstream behavior, whose run-now path preempts
+  incrementally until fit) instead of fencing the whole node. Such a job briefly loses commit
+  protection: freed capacity can be re-taken before it starts, and it retries vanilla-style.
+  Hetjobs and multi-node plans keep transactions even if a node is partially shared, since
+  losing commit semantics there reintroduces the preemption-storm risk; the cost is bounded
+  over-fencing of the shared nodes for the transaction's lifetime.
+
 ## Mitigation Levers
 
 `SchedulerParameters=bf_job_commit_timeout=0` plus `scontrol reconfigure` disables new ordinary
@@ -228,4 +266,7 @@ Before production rollout, exercise at least these cases and inspect controller 
 | Backfill cycle runs longer than two minutes (large `bf_max_time`) with healthy transactions | No spurious watchdog invalidation |
 | Job-array owner starts on its pinned plan | Started task carries no launch-transaction state; a later requeue of that task schedules normally |
 | `bf_job_commit_timeout=0` set via reconfigure with open transactions | New ordinary transactions stop and open ones drain on the next cycle; committed hetjob transactions require explicit cancellation |
+| Small job needing preemption on a fully packed shared node | Victim plan is pruned to a prefix-minimal set; no launch transaction is opened (plan shares its single node with non-victims); job starts via plain preempt-on-start |
+| Whole-node plan with many victims | Pruning confirms every victim is needed with one extra select test; all planned victims are signaled as before |
+| Multi-node plan with one partially shared node | Transaction opens with a pruned victim set; the shared node is fenced only for the transaction's lifetime |
 | Controller restart during a transaction | In-memory ownership is gone and stale `LaunchTxn:` status is cleared on backfill startup |

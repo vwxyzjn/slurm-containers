@@ -159,7 +159,7 @@
  static xhash_t *user_usage_map = NULL; /* look up user usage when no assoc */
  static bitstr_t *planned_bitmap = NULL;
  static bool soft_time_limit = false;
-@@ -263,6 +318,42 @@
+@@ -263,6 +318,60 @@
  static uint32_t _hetjob_calc_prio_tier(job_record_t *het_leader);
  static void _het_job_deadlock_fini(void);
  static bool _het_job_deadlock_test(job_record_t *job_ptr);
@@ -191,6 +191,24 @@
 +	time_t now);
 +static bool _launch_nodes_usable(bitstr_t *planned_node_bitmap,
 +				 uint32_t component_id, char **reason);
++static bool _launch_prefix_start_ok(job_record_t *job_ptr,
++				    bitstr_t *planned_node_bitmap,
++				    uint32_t min_nodes, uint32_t max_nodes,
++				    uint32_t req_nodes,
++				    resv_exc_t *resv_exc_ptr,
++				    list_t *preemptee_job_list,
++				    int prefix_cnt,
++				    list_t **pruned_job_list);
++static void _launch_prune_preemptee_list(job_record_t *job_ptr,
++					 bitstr_t *planned_node_bitmap,
++					 uint32_t min_nodes,
++					 uint32_t max_nodes,
++					 uint32_t req_nodes,
++					 resv_exc_t *resv_exc_ptr,
++					 list_t **preemptee_job_list);
++static bool _job_launch_plan_shares_nodes(job_record_t *job_ptr,
++					  bitstr_t *planned_node_bitmap,
++					  list_t *planned_preemptee_job_ids);
 +static bool _launch_txn_clear_status(job_record_t *job_ptr);
 +static void _launch_txn_clear_stale_status(void);
 +static char *_launch_txn_make_system_comment(
@@ -202,7 +220,7 @@
  static bool _job_part_valid(job_record_t *job_ptr, part_record_t *part_ptr);
  static void _load_config(void);
  static bool _many_pending_rpcs(void);
-@@ -272,10 +363,35 @@
+@@ -272,10 +381,35 @@
  			       bool *has_mor);
  static int  _het_job_find_map(void *x, void *key);
  static void _het_job_map_del(void *x);
@@ -240,7 +258,7 @@
  static bool _het_job_start_test_single(node_space_map_t *node_space,
  				       het_job_map_t *map, bool single);
  static int  _het_job_start_test_list(void *map, void *node_space);
-@@ -998,6 +1114,30 @@
+@@ -998,6 +1132,30 @@
  		info("bf_hetjob_immediate automatically sets bf_hetjob_prio=min");
  	}
  
@@ -271,7 +289,7 @@
  	if (xstrcasestr(sched_params, "bf_one_resv_per_job"))
  		bf_one_resv_per_job = true;
  	else
-@@ -1126,8 +1266,10 @@
+@@ -1126,8 +1284,10 @@
  {
  	_load_config();
  	het_job_list = list_create(_het_job_map_del);
@@ -282,7 +300,7 @@
  	FREE_NULL_LIST(het_job_list);
  	FREE_NULL_BITMAP(planned_bitmap);
  }
-@@ -1143,7 +1285,7 @@
+@@ -1143,7 +1303,7 @@
  		READ_LOCK, WRITE_LOCK, WRITE_LOCK, READ_LOCK, READ_LOCK };
  	bool load_config;
  	bool short_sleep = false;
@@ -291,7 +309,7 @@
  
  #if HAVE_SYS_PRCTL_H
  	if (prctl(PR_SET_NAME, "bckfl", NULL, NULL, NULL) < 0) {
-@@ -1154,6 +1296,10 @@
+@@ -1154,6 +1314,10 @@
  	last_backfill_time = time(NULL);
  	_init_planned_bitmap();
  	het_job_list = list_create(_het_job_map_del);
@@ -302,7 +320,7 @@
  	while (!stop_backfill) {
  		if (short_sleep)
  			_my_sleep(USEC_IN_SEC);
-@@ -1164,10 +1310,6 @@
+@@ -1164,10 +1328,6 @@
  		if (stop_backfill)
  			break;
  
@@ -313,7 +331,7 @@
  		slurm_mutex_lock(&config_lock);
  		if (config_flag) {
  			config_flag = false;
-@@ -1178,6 +1320,15 @@
+@@ -1178,6 +1338,15 @@
  		slurm_mutex_unlock(&config_lock);
  		if (load_config)
  			_load_config();
@@ -329,7 +347,7 @@
  		if (backfill_interval == -1) {
  			log_flag(BACKFILL, "skipping backfill cycle for %ds",
  				 BACKFILL_INTERVAL);
-@@ -1185,9 +1336,11 @@
+@@ -1185,9 +1354,11 @@
  		}
  		now = time(NULL);
  		wait_time = difftime(now, last_backfill_time);
@@ -344,7 +362,7 @@
  			short_sleep = true;
  			continue;
  		}
-@@ -1198,8 +1351,8 @@
+@@ -1198,8 +1369,8 @@
  
  		lock_slurmctld(all_locks);
  		validate_all_reservations(true, false);
@@ -355,7 +373,7 @@
  		_attempt_backfill();
  		last_backfill_time = time(NULL);
  		(void) bb_g_job_try_stage_in();
-@@ -1209,9 +1362,21 @@
+@@ -1209,9 +1380,21 @@
  		slurmctld_diag_stats.bf_active = 0;
  		slurm_mutex_unlock(&check_bf_running_lock);
  
@@ -378,7 +396,7 @@
  	xhash_free(user_usage_map); /* May have been init'ed if used */
  	FREE_NULL_BITMAP(planned_bitmap);
  
-@@ -2143,6 +2308,8 @@
+@@ -2143,6 +2326,8 @@
  	gettimeofday(&start_tv, NULL);
  
  	_handle_planned(nodes_planned);
@@ -387,7 +405,7 @@
  
  	job_queue = build_job_queue(true, true);
  	job_test_count = list_count(job_queue);
-@@ -2183,6 +2350,9 @@
+@@ -2183,6 +2368,9 @@
  	node_space[0].avail_bitmap = bit_copy(avail_node_bitmap);
  	/* Make "resuming" nodes available to be scheduled in backfill */
  	bit_or(node_space[0].avail_bitmap, rs_node_bitmap);
@@ -397,7 +415,7 @@
  
  	if (bf_licenses)
  		node_space[0].licenses =
-@@ -2222,6 +2392,7 @@
+@@ -2222,6 +2410,7 @@
  	}
  
  	sort_job_queue(job_queue);
@@ -405,7 +423,7 @@
  
  	/* Ignore nodes that have been set as available during this cycle. */
  	bit_clear_all(bf_ignore_node_bitmap);
-@@ -2235,6 +2406,7 @@
+@@ -2235,6 +2424,7 @@
  		bool licenses_unavail;
  		bool use_prefer = false;
  		slurmctld_resv_t *resv_ptr = NULL;
@@ -413,7 +431,7 @@
  
  		/* Run some final guaranteed logic after each job iteration */
  		if (job_ptr) {
-@@ -2349,11 +2521,17 @@
+@@ -2349,11 +2539,17 @@
  			job_queue_rec->job_ptr = job_ptr;
  		}
  
@@ -432,7 +450,7 @@
  
  		if (job_ptr->het_job_id &&
  		    (job_ptr->state_reason == WAIT_NO_REASON)) {
-@@ -2386,6 +2564,13 @@
+@@ -2386,6 +2582,13 @@
  		if (het_job_time > (now + backfill_window))
  			continue;
  
@@ -446,7 +464,7 @@
  		if (job_ptr->qos_ptr) {
  			assoc_mgr_lock_t locks = {
  				.assoc = READ_LOCK,
-@@ -2837,6 +3022,9 @@
+@@ -2837,6 +3040,9 @@
  		bit_and(avail_bitmap, part_ptr->node_bitmap);
  		bit_and(avail_bitmap, up_node_bitmap);
  		bit_and_not(avail_bitmap, bf_ignore_node_bitmap);
@@ -456,7 +474,7 @@
  
  		if (job_ptr->details->exc_node_bitmap) {
  			bit_and_not(avail_bitmap,
-@@ -3205,9 +3393,48 @@
+@@ -3205,9 +3411,58 @@
  			   (job_ptr->start_time <= now)) { /* Can start now */
  			uint32_t save_time_limit = job_ptr->time_limit;
  			uint32_t hard_limit;
@@ -472,6 +490,16 @@
 +						job_ptr, avail_bitmap, min_nodes,
 +						max_nodes, req_nodes, &resv_exc,
 +						&will_run_data);
++				if (planned_preemptee_job_ids &&
++				    list_count(planned_preemptee_job_ids) &&
++				    _job_launch_plan_shares_nodes(
++					    job_ptr, avail_bitmap,
++					    planned_preemptee_job_ids)) {
++					log_flag(BACKFILL, "%pJ plan shares its node with non-victim jobs; starting without a launch transaction",
++						 job_ptr);
++					FREE_NULL_LIST(
++						planned_preemptee_job_ids);
++				}
 +				if (planned_preemptee_job_ids &&
 +				    list_count(planned_preemptee_job_ids)) {
 +					job_launch = _job_launch_begin(
@@ -505,7 +533,7 @@
  			/* get fed job lock from origin cluster */
  			if (fed_mgr_job_lock(job_ptr)) {
  				log_flag(BACKFILL, "%pJ can't get fed job lock from origin cluster to backfill job",
-@@ -3231,6 +3458,41 @@
+@@ -3231,6 +3486,41 @@
  			}
  
  skip_start:
@@ -547,7 +575,7 @@
  			if (qos_flags & QOS_FLAG_NO_RESERVE) {
  				if (orig_time_limit == NO_VAL) {
  					acct_policy_alter_job(
-@@ -3390,13 +3652,23 @@
+@@ -3390,13 +3680,23 @@
  			}
  		} else if (job_ptr->het_job_id != 0) {
  			uint32_t max_time_limit;
@@ -572,7 +600,7 @@
  			_set_job_time_limit(job_ptr, orig_time_limit);
  			if (bf_hetjob_immediate &&
  			    (!max_backfill_jobs_start ||
-@@ -3643,10 +3915,15 @@
+@@ -3643,10 +3943,15 @@
  	}
  
  	_het_job_deadlock_fini();
@@ -591,7 +619,7 @@
  
  	FREE_NULL_BITMAP(avail_bitmap);
  	FREE_NULL_BITMAP(excluded_topo_bitmap);
-@@ -4075,247 +4352,1780 @@
+@@ -4075,244 +4380,1948 @@
  }
  
  /*
@@ -750,26 +778,53 @@
 +	return planned_preemptee_job_ids;
  }
  
--/*
+ /*
 - * Return the earliest that a job can start based upon _other_ components of
 - * that same heterogeneous job. Return 0 if no limitation.
 - *
 - * If the job's state reason is BeginTime (the way all hetjobs start) and that
 - * time is passed, then clear the reason field.
-- */
++ * Test whether the job could start now on its planned nodes if only the
++ * first prefix_cnt entries of preemptee_job_list were preempted. On success
++ * with pruned_job_list set, return the select plugin's victim list for that
++ * prefix (a subset of the prefix) through it.
+  */
 -static time_t _het_job_start_find(job_record_t *job_ptr)
-+static list_t *_het_job_select_planned_preemptee_ids(
-+	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
-+	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
-+	resv_exc_t *resv_exc_ptr, will_run_data_t *will_run)
++static bool _launch_prefix_start_ok(job_record_t *job_ptr,
++				    bitstr_t *planned_node_bitmap,
++				    uint32_t min_nodes, uint32_t max_nodes,
++				    uint32_t req_nodes,
++				    resv_exc_t *resv_exc_ptr,
++				    list_t *preemptee_job_list,
++				    int prefix_cnt,
++				    list_t **pruned_job_list)
  {
 -	het_job_map_t *map;
 -	time_t latest_start = (time_t) 0;
-+	list_t *preemptee_candidates, *preemptee_job_list = NULL;
-+	list_t *planned_preemptee_job_ids = NULL;
++	list_t *prefix, *result_list = NULL;
++	list_itr_t *iter;
++	job_record_t *preemptee;
 +	bitstr_t *test_bitmap;
-+	time_t orig_start_time;
-+	int rc;
++	time_t orig_start_time = job_ptr->start_time;
++	time_t now = time(NULL);
++	/*
++	 * Bound the will-run window at now: an insufficient prefix can only
++	 * produce a future start time, which the acceptance check below
++	 * rejects anyway, so simulating the future job-completion timeline
++	 * is pure cost. With end = now the window loop exits at the first
++	 * queued running job instead of iterating the whole job list.
++	 */
++	will_run_data_t prefix_will_run = { .start = 0, .end = now };
++	bool ok;
++	int rc, cnt = 0;
++
++	prefix = list_create(NULL);
++	iter = list_iterator_create(preemptee_job_list);
++	while ((cnt < prefix_cnt) && (preemptee = list_next(iter))) {
++		list_append(prefix, preemptee);
++		cnt++;
++	}
++	list_iterator_destroy(iter);
  
 -	if (job_ptr->het_job_id) {
 -		map = list_find_first(het_job_list, _het_job_find_map,
@@ -778,62 +833,57 @@
 -			latest_start = _het_job_start_compute(map,
 -							      job_ptr->job_id);
 -		}
-+	if (!job_ptr || !planned_node_bitmap)
-+		return NULL;
++	test_bitmap = bit_copy(planned_node_bitmap);
++	rc = select_g_job_test(job_ptr, test_bitmap, min_nodes, max_nodes,
++			       req_nodes, SELECT_MODE_WILL_RUN, prefix,
++			       &result_list, resv_exc_ptr, &prefix_will_run);
++	ok = (rc == SLURM_SUCCESS) && (job_ptr->start_time <= now);
++	job_ptr->start_time = orig_start_time;
  
 -		log_flag(HETJOB, "%pJ in partition %s expected to start in %ld secs",
 -			 job_ptr, job_ptr->part_ptr->name,
 -			 MAX(0, latest_start - time(NULL)));
-+	preemptee_candidates = slurm_find_preemptable_jobs(job_ptr);
-+	if (!preemptee_candidates)
-+		return NULL;
-+
-+	test_bitmap = bit_copy(planned_node_bitmap);
-+	orig_start_time = job_ptr->start_time;
-+	rc = select_g_job_test(job_ptr, test_bitmap, min_nodes, max_nodes,
-+			       req_nodes, SELECT_MODE_WILL_RUN,
-+			       preemptee_candidates, &preemptee_job_list,
-+			       resv_exc_ptr, will_run);
-+	job_ptr->start_time = orig_start_time;
-+
-+	if (rc == SLURM_SUCCESS)
-+		planned_preemptee_job_ids =
-+			_het_job_copy_preemptee_job_ids(preemptee_job_list);
-+
-+	if (planned_preemptee_job_ids) {
-+		if (job_ptr->het_job_id)
-+			log_flag(HETJOB,
-+				 "%pJ planned %d preemptee jobs for hetjob start",
-+				 job_ptr,
-+				 list_count(planned_preemptee_job_ids));
-+		else
-+			log_flag(BACKFILL,
-+				 "%pJ planned %d preemptee jobs for pinned start",
-+				 job_ptr,
-+				 list_count(planned_preemptee_job_ids));
++	if (ok && pruned_job_list) {
++		*pruned_job_list = result_list;
++		result_list = NULL;
  	}
++	FREE_NULL_LIST(result_list);
++	FREE_NULL_LIST(prefix);
++	FREE_NULL_BITMAP(test_bitmap);
  
 -	return latest_start;
-+	FREE_NULL_LIST(preemptee_job_list);
-+	FREE_NULL_LIST(preemptee_candidates);
-+	FREE_NULL_BITMAP(test_bitmap);
-+
-+	return planned_preemptee_job_ids;
++	return ok;
  }
  
--/*
+ /*
 - * Record the earliest that a hetjob component can start. If it can be
 - * started in multiple partitions, we only record the earliest start time
 - * for the job in any partition and reservation.
-- */
++ * Reduce a planned victim list to a prefix-minimal set. The select plugin's
++ * WILL_RUN result lists every preemptable candidate whose nodes overlap the
++ * selection, with no minimal-subset pruning; on a shared node that is every
++ * preemptible job on the node, so a small job's plan would signal victims
++ * whose resources it does not need (observed in production: a 4-CPU job
++ * preempting ~30 tasks on a 192-core shared node). Keep the shortest prefix,
++ * in the list's existing preemption-priority order, that still lets the job
++ * start now. When every victim is needed (the whole-node case) this costs a
++ * single extra select test; otherwise a binary search over prefix length,
++ * O(log victims) tests, one-time per plan.
+  */
 -static void _het_job_start_set(job_record_t *job_ptr, time_t latest_start,
 -			       uint32_t comp_time_limit)
-+static int _job_launch_find_id(void *x, void *key)
++static void _launch_prune_preemptee_list(job_record_t *job_ptr,
++					 bitstr_t *planned_node_bitmap,
++					 uint32_t min_nodes,
++					 uint32_t max_nodes,
++					 uint32_t req_nodes,
++					 resv_exc_t *resv_exc_ptr,
++					 list_t **preemptee_job_list)
  {
 -	het_job_map_t *map;
 -	het_job_rec_t *rec;
-+	job_launch_t *launch = x;
-+	uint32_t *job_id = key;
++	list_t *pruned = NULL;
++	int total, lo, hi;
  
 -	if (comp_time_limit == NO_VAL)
 -		comp_time_limit = job_ptr->time_limit;
@@ -875,8 +925,11 @@
 -			rec->latest_start = latest_start;
 -			rec->part_ptr = job_ptr->part_ptr;
 -			rec->resv_ptr = job_ptr->resv_ptr;
-+	return launch->job_id == *job_id;
-+}
++	if (!preemptee_job_list || !*preemptee_job_list)
++		return;
++	total = list_count(*preemptee_job_list);
++	if (total < 2)
++		return;
  
 -			map = xmalloc(sizeof(het_job_map_t));
 -			map->comp_time_limit = comp_time_limit;
@@ -884,27 +937,49 @@
 -			map->het_job_rec_list = list_create(xfree_ptr);
 -			list_append(map->het_job_rec_list, rec);
 -			list_append(het_job_list, map);
--		}
-+static bool _launch_transactions_active(void)
-+{
-+	if (job_launch_list && list_count(job_launch_list))
-+		return true;
-+	if (het_job_launch_node_bitmap &&
-+	    (bit_ffs(het_job_launch_node_bitmap) >= 0))
-+		return true;
-+	return false;
-+}
++	/*
++	 * Only prune plans whose node count is pinned. With a flexible
++	 * count (min_nodes != max_nodes) a probe could validate a smaller
++	 * placement than the committed one and prune victims the committed
++	 * shape still needs.
++	 */
++	if ((min_nodes != max_nodes) &&
++	    (bit_set_count(planned_node_bitmap) > 1))
++		return;
++
++	if (!_launch_prefix_start_ok(job_ptr, planned_node_bitmap, min_nodes,
++				     max_nodes, req_nodes, resv_exc_ptr,
++				     *preemptee_job_list, total - 1, &pruned))
++		return;	/* every planned victim is needed */
++
++	lo = 1;
++	hi = total - 1;	/* known sufficient; result captured in pruned */
++	while (lo < hi) {
++		list_t *mid_list = NULL;
++		int mid = lo + ((hi - lo) / 2);
++
++		if (_launch_prefix_start_ok(job_ptr, planned_node_bitmap,
++					    min_nodes, max_nodes, req_nodes,
++					    resv_exc_ptr, *preemptee_job_list,
++					    mid, &mid_list)) {
++			FREE_NULL_LIST(pruned);
++			pruned = mid_list;
++			hi = mid;
++		} else {
++			lo = mid + 1;
+ 		}
++	}
  
 -		log_flag(HETJOB, "%pJ in partition %s set to start in %ld secs",
 -			 job_ptr, job_ptr->part_ptr->name,
 -			 MAX(0, _het_job_start_compute(map, 0) - time(NULL)));
--	}
-+static job_launch_t *_job_launch_find(uint32_t job_id)
-+{
-+	if (!job_launch_list || !job_id)
-+		return NULL;
-+
-+	return list_find_first(job_launch_list, _job_launch_find_id, &job_id);
++	if (pruned) {
++		log_flag(BACKFILL,
++			 "%pJ pruned planned preemptions from %d to %d",
++			 job_ptr, total, list_count(pruned));
++		FREE_NULL_LIST(*preemptee_job_list);
++		*preemptee_job_list = pruned;
+ 	}
  }
  
 -/*
@@ -915,20 +990,48 @@
 - * other components are already running,
 - */
 -static bool _het_job_full(het_job_map_t *map)
-+static bool _launch_txn_clear_status(job_record_t *job_ptr)
++static list_t *_het_job_select_planned_preemptee_ids(
++	job_record_t *job_ptr, bitstr_t *planned_node_bitmap,
++	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes,
++	resv_exc_t *resv_exc_ptr, will_run_data_t *will_run)
  {
 -	job_record_t *het_job_ptr, *job_ptr;
 -	list_itr_t *iter;
 -	bool rc = true;
-+	bool changed = false;
++	list_t *preemptee_candidates, *preemptee_job_list = NULL;
++	list_t *planned_preemptee_job_ids = NULL;
++	bitstr_t *test_bitmap;
++	time_t orig_start_time;
++	int rc;
  
 -	het_job_ptr = find_job_record(map->het_job_id);
 -	if (!het_job_ptr || !het_job_ptr->het_job_list ||
 -	    (!IS_JOB_RUNNING(het_job_ptr) &&
 -	     !_job_runnable_now(het_job_ptr))) {
-+	if (!job_ptr)
- 		return false;
--	}
+-		return false;
++	if (!job_ptr || !planned_node_bitmap)
++		return NULL;
++
++	preemptee_candidates = slurm_find_preemptable_jobs(job_ptr);
++	if (!preemptee_candidates)
++		return NULL;
++
++	test_bitmap = bit_copy(planned_node_bitmap);
++	orig_start_time = job_ptr->start_time;
++	rc = select_g_job_test(job_ptr, test_bitmap, min_nodes, max_nodes,
++			       req_nodes, SELECT_MODE_WILL_RUN,
++			       preemptee_candidates, &preemptee_job_list,
++			       resv_exc_ptr, will_run);
++	job_ptr->start_time = orig_start_time;
++
++	if (rc == SLURM_SUCCESS) {
++		_launch_prune_preemptee_list(job_ptr, planned_node_bitmap,
++					     min_nodes, max_nodes, req_nodes,
++					     resv_exc_ptr,
++					     &preemptee_job_list);
++		planned_preemptee_job_ids =
++			_het_job_copy_preemptee_job_ids(preemptee_job_list);
+ 	}
  
 -	iter = list_iterator_create(het_job_ptr->het_job_list);
 -	while ((job_ptr = list_next(iter))) {
@@ -945,27 +1048,26 @@
 -			rc = false;
 -			break;
 -		}
-+	if (job_ptr->system_comment &&
-+	    !xstrncmp(job_ptr->system_comment,
-+		      LAUNCH_TXN_SYSTEM_COMMENT_PREFIX,
-+		      strlen(LAUNCH_TXN_SYSTEM_COMMENT_PREFIX))) {
-+		xfree(job_ptr->system_comment);
-+		changed = true;
++	if (planned_preemptee_job_ids) {
++		if (job_ptr->het_job_id)
++			log_flag(HETJOB,
++				 "%pJ planned %d preemptee jobs for hetjob start",
++				 job_ptr,
++				 list_count(planned_preemptee_job_ids));
++		else
++			log_flag(BACKFILL,
++				 "%pJ planned %d preemptee jobs for pinned start",
++				 job_ptr,
++				 list_count(planned_preemptee_job_ids));
  	}
 -	list_iterator_destroy(iter);
-+	if (IS_JOB_PENDING(job_ptr) &&
-+	    (!xstrcmp(job_ptr->state_desc, "PreemptionPlanned") ||
-+	     !xstrcmp(job_ptr->state_desc, "Preempting") ||
-+	     !xstrcmp(job_ptr->state_desc, "HetjobPartialLaunch"))) {
-+		xfree(job_ptr->state_desc);
-+		job_ptr->state_reason = WAIT_RESOURCES;
-+		changed = true;
-+	}
-+	if (changed)
-+		last_job_update = time(NULL);
  
 -	return rc;
-+	return changed;
++	FREE_NULL_LIST(preemptee_job_list);
++	FREE_NULL_LIST(preemptee_candidates);
++	FREE_NULL_BITMAP(test_bitmap);
++
++	return planned_preemptee_job_ids;
  }
  
 -/*
@@ -979,19 +1081,73 @@
 - * would not be accurate.
 - */
 -static bool _het_job_limit_check(het_job_map_t *map, time_t now)
-+static void _launch_txn_clear_stale_status(void)
++static int _job_launch_find_id(void *x, void *key)
  {
- 	job_record_t *job_ptr;
+-	job_record_t *job_ptr;
 -	het_job_rec_t *rec;
- 	list_itr_t *iter;
+-	list_itr_t *iter;
 -	int begun_jobs = 0, fini_jobs = 0, slurmctld_tres_size;
 -	bool runnable = true;
 -	uint32_t selected_node_cnt;
 -	uint64_t tres_req_cnt[slurmctld_tres_cnt];
--	uint64_t **tres_alloc_save = NULL;
++	job_launch_t *launch = x;
++	uint32_t *job_id = key;
++
++	return launch->job_id == *job_id;
++}
++
++static bool _launch_transactions_active(void)
++{
++	if (job_launch_list && list_count(job_launch_list))
++		return true;
++	if (het_job_launch_node_bitmap &&
++	    (bit_ffs(het_job_launch_node_bitmap) >= 0))
++		return true;
++	return false;
++}
++
++static job_launch_t *_job_launch_find(uint32_t job_id)
++{
++	if (!job_launch_list || !job_id)
++		return NULL;
++
++	return list_find_first(job_launch_list, _job_launch_find_id, &job_id);
++}
++
++static bool _launch_txn_clear_status(job_record_t *job_ptr)
++{
++	bool changed = false;
++
++	if (!job_ptr)
++		return false;
++
++	if (job_ptr->system_comment &&
++	    !xstrncmp(job_ptr->system_comment,
++		      LAUNCH_TXN_SYSTEM_COMMENT_PREFIX,
++		      strlen(LAUNCH_TXN_SYSTEM_COMMENT_PREFIX))) {
++		xfree(job_ptr->system_comment);
++		changed = true;
++	}
++	if (IS_JOB_PENDING(job_ptr) &&
++	    (!xstrcmp(job_ptr->state_desc, "PreemptionPlanned") ||
++	     !xstrcmp(job_ptr->state_desc, "Preempting") ||
++	     !xstrcmp(job_ptr->state_desc, "HetjobPartialLaunch"))) {
++		xfree(job_ptr->state_desc);
++		job_ptr->state_reason = WAIT_RESOURCES;
++		changed = true;
++	}
++	if (changed)
++		last_job_update = time(NULL);
++
++	return changed;
++}
++
++static void _launch_txn_clear_stale_status(void)
++{
++	job_record_t *job_ptr;
++	list_itr_t *iter;
 +	uint32_t cleared = 0;
- 
--	tres_alloc_save = xcalloc(list_count(map->het_job_rec_list),
++
 +	if (!job_list)
 +		return;
 +
@@ -1450,6 +1606,43 @@
 +	list_iterator_destroy(iter);
 +
 +	return true;
++}
++
++/*
++ * A launch transaction fences whole nodes from every other scheduling path
++ * for its lifetime. That is the right trade for plans that consume their
++ * nodes outright, but a single-node plan that would still share its node
++ * with running jobs that are not planned victims (a shared partition) would
++ * fence the entire node to place a small allocation. Such plans fall back
++ * to plain preempt-on-start instead of opening a transaction.
++ */
++static bool _job_launch_plan_shares_nodes(job_record_t *job_ptr,
++					  bitstr_t *planned_node_bitmap,
++					  list_t *planned_preemptee_job_ids)
++{
++	job_record_t *resident;
++	list_itr_t *iter;
++	bool shares = false;
++
++	if (!planned_node_bitmap || (bit_set_count(planned_node_bitmap) > 1))
++		return false;
++
++	iter = list_iterator_create(job_list);
++	while ((resident = list_next(iter))) {
++		if (!IS_JOB_RUNNING(resident) && !IS_JOB_SUSPENDED(resident))
++			continue;
++		if (!_het_job_job_on_planned_nodes(planned_node_bitmap,
++						   resident))
++			continue;
++		if (_het_job_id_in_list(planned_preemptee_job_ids,
++					resident->job_id))
++			continue;
++		shares = true;
++		break;
++	}
++	list_iterator_destroy(iter);
++
++	return shares;
 +}
 +
 +static job_launch_t *_job_launch_begin(
@@ -2555,13 +2748,10 @@
 +	bool runnable = true;
 +	uint32_t selected_node_cnt;
 +	uint64_t tres_req_cnt[slurmctld_tres_cnt];
-+	uint64_t **tres_alloc_save = NULL;
-+
-+	tres_alloc_save = xcalloc(list_count(map->het_job_rec_list),
- 				  sizeof(uint64_t *));
- 	slurmctld_tres_size = sizeof(uint64_t) * slurmctld_tres_cnt;
- 	iter = list_iterator_create(map->het_job_rec_list);
-@@ -4327,7 +6137,11 @@
+ 	uint64_t **tres_alloc_save = NULL;
+ 
+ 	tres_alloc_save = xcalloc(list_count(map->het_job_rec_list),
+@@ -4327,7 +6336,11 @@
  			.tres = READ_LOCK,
  		};
  
@@ -2574,7 +2764,7 @@
  		job_ptr->part_ptr = rec->part_ptr;
  		if (rec->resv_ptr) {
  			job_ptr->resv_ptr = rec->resv_ptr;
-@@ -4382,7 +6196,9 @@
+@@ -4382,7 +6395,9 @@
  
  	list_iterator_reset(iter);
  	while ((rec = list_next(iter))) {
@@ -2585,7 +2775,7 @@
  		if (begun_jobs > fini_jobs) {
  			time_t end_time_exp = job_ptr->end_time_exp;
  			time_t end_time = job_ptr->end_time;
-@@ -4408,7 +6224,202 @@
+@@ -4408,7 +6423,202 @@
  /*
   * Start all components of a hetjob now
   */
@@ -2789,7 +2979,7 @@
  {
  	job_record_t *job_ptr;
  	bitstr_t *avail_bitmap = NULL;
-@@ -4416,6 +6427,7 @@
+@@ -4416,6 +6626,7 @@
  	het_job_rec_t *rec;
  	list_itr_t *iter;
  	int rc = SLURM_SUCCESS;
@@ -2797,7 +2987,7 @@
  	bool resv_overlap = false;
  	time_t now = time(NULL), start_res;
  	uint32_t hard_limit;
-@@ -4424,13 +6436,31 @@
+@@ -4424,13 +6635,31 @@
  	iter = list_iterator_create(map->het_job_rec_list);
  	while ((rec = list_next(iter))) {
  		bool reset_time = false;
@@ -2830,7 +3020,7 @@
  		/*
  		 * Identify the nodes which this job can use
  		 */
-@@ -4442,6 +6472,7 @@
+@@ -4442,6 +6671,7 @@
  			error("%pJ failed to start due to reservation",
  			      job_ptr);
  			FREE_NULL_BITMAP(avail_bitmap);
@@ -2838,7 +3028,7 @@
  			break;
  		}
  		bit_and(avail_bitmap, job_ptr->part_ptr->node_bitmap);
-@@ -4452,12 +6483,19 @@
+@@ -4452,12 +6682,19 @@
  			bit_and_not(avail_bitmap,
  				job_ptr->details->exc_node_bitmap);
  		}
@@ -2859,7 +3049,7 @@
  		}
  
  		resv_bitmap = avail_bitmap;
-@@ -4466,6 +6504,8 @@
+@@ -4466,6 +6703,8 @@
  		rc = _start_job(job_ptr, resv_bitmap);
  		FREE_NULL_BITMAP(resv_bitmap);
  		if (rc == SLURM_SUCCESS) {
@@ -2868,7 +3058,7 @@
  			/*
  			 * If the following fails because of network
  			 * connectivity, the origin cluster should ask
-@@ -4474,12 +6514,16 @@
+@@ -4474,12 +6713,16 @@
  			 */
  			fed_mgr_job_start(job_ptr, job_ptr->start_time);
  			log_flag(HETJOB, "%pJ started", job_ptr);
@@ -2889,7 +3079,7 @@
  			break;
  		}
  		if (job_ptr->time_min) {
-@@ -4507,13 +6551,13 @@
+@@ -4507,13 +6750,13 @@
  	list_iterator_destroy(iter);
  	FREE_NULL_BITMAP(used_bitmap);
  
@@ -2905,7 +3095,7 @@
  {
  	job_record_t *job_ptr;
  	het_job_rec_t *rec;
-@@ -4522,10 +6566,14 @@
+@@ -4522,10 +6765,14 @@
  	int cred_lifetime = 1200;
  	uint32_t save_bitflags;
  
@@ -2921,7 +3111,7 @@
  		if (IS_JOB_PENDING(job_ptr))
  			continue;
  		info("Deallocate %pJ due to hetjob start failure",
-@@ -4563,14 +6611,17 @@
+@@ -4563,14 +6810,17 @@
  				       het_job_map_t *map, bool single)
  {
  	time_t now = time(NULL);
@@ -2941,7 +3131,7 @@
  		if (!single)
  			map->prev_start = now + YEAR_SECONDS;
  		return false;
-@@ -4578,14 +6629,27 @@
+@@ -4578,14 +6828,27 @@
  
  	map->prev_start = _het_job_start_compute(map, 0);
  	if (map->prev_start > now) {
@@ -2970,7 +3160,7 @@
  
  		map->prev_start = now + YEAR_SECONDS;
  		return false;
-@@ -4593,11 +6657,55 @@
+@@ -4593,11 +6856,55 @@
  
  	log_flag(HETJOB, "Attempting to start hetjob %u", map->het_job_id);
  
@@ -3027,7 +3217,7 @@
  		job_start_cnt += list_count(map->het_job_rec_list);
  		if (max_backfill_jobs_start &&
  		    (job_start_cnt >= max_backfill_jobs_start)) {
-@@ -4619,12 +6727,36 @@
+@@ -4619,12 +6926,36 @@
  	return SLURM_SUCCESS;
  }
  
