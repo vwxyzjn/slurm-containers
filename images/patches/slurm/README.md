@@ -41,6 +41,7 @@ licenses.
   - [0033-launch-transaction-reliability.patch](#0033-launch-transaction-reliabilitypatch)
   - [0034-launch-transaction-bounded-replan.patch](#0034-launch-transaction-bounded-replanpatch)
   - [0035-launch-transaction-minimal-victims.patch](#0035-launch-transaction-minimal-victimspatch)
+  - [0036-launch-transaction-visibility.patch](#0036-launch-transaction-visibilitypatch)
 
 ### 0001-max-server-threads
 
@@ -468,3 +469,23 @@ fresh active handoff cannot be created until the cooldown marker expires.
 Setting `bf_job_commit_timeout=0` restores the legacy
 non-transactional preemption path. QOS `GraceTime` remains authoritative after
 the transaction signals its selected victims.
+
+### 0036-launch-transaction-visibility.patch
+
+This patch exposes the exact node plan already owned by an active launch
+transaction. Ordinary jobs publish their committed bitmap as `SchedNodeList`;
+each pending heterogeneous-job component publishes its own committed bitmap.
+Backfill preserves that value only while the matching transaction is committed
+or draining cleanup, then clears it when ownership is released or a bounded
+replan enters cooldown. The displayed nodes therefore describe the immutable
+plan being retried rather than a disposable backfill estimate.
+
+The launch status collector also intersects every current blocker with the
+committed bitmap and adds the compressed blocker nodes to the namespaced
+`SystemComment`. The node expression is capped at 256 characters and marked as
+truncated when necessary. `SchedNodeList` remains the complete committed plan;
+the comment names only nodes still occupied by tracked blocking jobs.
+
+This is an observability-only change. It does not select nodes, signal jobs,
+alter QOS grace time, change transaction ownership, or modify launch and replan
+decisions.

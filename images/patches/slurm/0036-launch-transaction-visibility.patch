@@ -1,0 +1,284 @@
+diff --git a/src/plugins/sched/backfill/backfill.c b/src/plugins/sched/backfill/backfill.c
+index 031bce2..5bfee8c 100644
+--- a/src/plugins/sched/backfill/backfill.c
++++ b/src/plugins/sched/backfill/backfill.c
+@@ -135,6 +135,7 @@
+ #define MAX_YIELD_RPC_CNT 200
+ #define MAX_YIELD_SLEEP                10000000 /* 10 seconds in usec */
+ #define LAUNCH_TXN_SYSTEM_COMMENT_PREFIX "LaunchTxn: "
++#define LAUNCH_TXN_COMMENT_NODE_CHARS 256
+ 
+ #define MAX_BF_MAX_JOB_ASSOC           MAX_BF_MAX_JOB_TEST
+ #define MAX_BF_MAX_JOB_USER            MAX_BF_MAX_JOB_TEST
+@@ -218,6 +219,7 @@ typedef struct {
+ 	time_t grace_deadline;
+ 	time_t grace_duration;
+ 	bool waiting_for_nodes;
++	bitstr_t *blocker_node_bitmap;
+ 	list_t *blocker_job_ids;
+ } launch_preempt_status_t;
+ 
+@@ -378,6 +380,8 @@ static void _job_launch_set_start_retry(job_record_t *job_ptr,
+ static void _job_launch_update_status(job_record_t *job_ptr,
+ 				      job_launch_t *launch, time_t now,
+ 				      bool waiting_for_nodes);
++static void _launch_txn_append_blocker_nodes(
++	char **comment, launch_preempt_status_t *status);
+ static void _launch_txn_add_preempt_status(
+ 	launch_preempt_status_t *status, job_record_t *preemptor,
+ 	bitstr_t *planned_node_bitmap, list_t *planned_preemptee_job_ids,
+@@ -386,9 +390,12 @@ static bool _launch_nodes_usable(bitstr_t *planned_node_bitmap,
+ 				 uint32_t component_id, char **reason);
+ static bool _launch_txn_clear_status(job_record_t *job_ptr);
+ static void _launch_txn_clear_stale_status(void);
++static bool _launch_txn_owns_sched_nodes(job_record_t *job_ptr);
+ static char *_launch_txn_make_system_comment(
+ 	launch_preempt_status_t *status, time_t now, time_t launch_start,
+ 	int commit_timeout, bool irrevocable);
++static bool _launch_txn_set_sched_nodes(job_record_t *job_ptr,
++					bitstr_t *planned_node_bitmap);
+ static void _launch_txn_set_system_comment(job_record_t *job_ptr,
+ 					   const char *comment);
+ static bool _launch_transactions_active(void);
+@@ -1469,7 +1476,8 @@ static int _clear_job_estimates(void *x, void *arg)
+ 	job_record_t *job_ptr = (job_record_t *) x;
+ 	if (IS_JOB_PENDING(job_ptr)) {
+ 		job_ptr->start_time = 0;
+-		xfree(job_ptr->sched_nodes);
++		if (!_launch_txn_owns_sched_nodes(job_ptr))
++			xfree(job_ptr->sched_nodes);
+ 	}
+ 	return SLURM_SUCCESS;
+ }
+@@ -4694,6 +4702,45 @@ static job_launch_t *_job_launch_find(uint32_t job_id)
+ 	return list_find_first(job_launch_list, _job_launch_find_id, &job_id);
+ }
+ 
++static bool _launch_txn_owns_sched_nodes(job_record_t *job_ptr)
++{
++	het_job_map_t *map;
++
++	if (!job_ptr || !IS_JOB_PENDING(job_ptr))
++		return false;
++	if (_job_launch_find(job_ptr->job_id))
++		return true;
++	if (!job_ptr->het_job_id || !het_job_list)
++		return false;
++
++	map = list_find_first(het_job_list, _het_job_find_map,
++			      &job_ptr->het_job_id);
++	return map && ((map->launch_state == HET_LAUNCH_COMMITTED) ||
++		       (map->launch_state == HET_LAUNCH_CLEANUP));
++}
++
++static bool _launch_txn_set_sched_nodes(job_record_t *job_ptr,
++					bitstr_t *planned_node_bitmap)
++{
++	char *sched_nodes = NULL;
++
++	if (!job_ptr || !IS_JOB_PENDING(job_ptr))
++		return false;
++	if (planned_node_bitmap)
++		sched_nodes = bitmap2node_name(planned_node_bitmap);
++	if ((!sched_nodes && !job_ptr->sched_nodes) ||
++	    (sched_nodes && job_ptr->sched_nodes &&
++	     !xstrcmp(sched_nodes, job_ptr->sched_nodes))) {
++		xfree(sched_nodes);
++		return false;
++	}
++
++	xfree(job_ptr->sched_nodes);
++	job_ptr->sched_nodes = sched_nodes;
++	last_job_update = time(NULL);
++	return true;
++}
++
+ static bool _launch_txn_clear_status(job_record_t *job_ptr)
+ {
+ 	bool changed = false;
+@@ -4716,6 +4763,8 @@ static bool _launch_txn_clear_status(job_record_t *job_ptr)
+ 		job_ptr->state_reason = WAIT_RESOURCES;
+ 		changed = true;
+ 	}
++	if (_launch_txn_set_sched_nodes(job_ptr, NULL))
++		changed = true;
+ 	if (changed)
+ 		last_job_update = time(NULL);
+ 
+@@ -4768,6 +4817,38 @@ static void _launch_txn_set_system_comment(job_record_t *job_ptr,
+ 	last_job_update = time(NULL);
+ }
+ 
++static void _launch_txn_add_blocker_nodes(
++	launch_preempt_status_t *status, bitstr_t *planned_node_bitmap,
++	job_record_t *preemptee)
++{
++	bitstr_t *blocker_node_bitmap = NULL;
++
++	if (!status || !planned_node_bitmap || !preemptee)
++		return;
++	if (preemptee->node_bitmap)
++		blocker_node_bitmap = bit_copy(preemptee->node_bitmap);
++	if (preemptee->node_bitmap_cg) {
++		if (blocker_node_bitmap)
++			bit_or(blocker_node_bitmap, preemptee->node_bitmap_cg);
++		else
++			blocker_node_bitmap = bit_copy(preemptee->node_bitmap_cg);
++	}
++	if (!blocker_node_bitmap)
++		return;
++
++	bit_and(blocker_node_bitmap, planned_node_bitmap);
++	if (bit_ffs(blocker_node_bitmap) < 0) {
++		FREE_NULL_BITMAP(blocker_node_bitmap);
++		return;
++	}
++	if (status->blocker_node_bitmap) {
++		bit_or(status->blocker_node_bitmap, blocker_node_bitmap);
++		FREE_NULL_BITMAP(blocker_node_bitmap);
++	} else {
++		status->blocker_node_bitmap = blocker_node_bitmap;
++	}
++}
++
+ static void _launch_txn_add_preempt_status(
+ 	launch_preempt_status_t *status, job_record_t *preemptor,
+ 	bitstr_t *planned_node_bitmap, list_t *planned_preemptee_job_ids,
+@@ -4787,8 +4868,6 @@ static void _launch_txn_add_preempt_status(
+ 
+ 		if (!preemptee)
+ 			continue;
+-		if (_het_job_id_in_list(status->blocker_job_ids, *job_id))
+-			continue;
+ 		if (!job_overlap_and_running(planned_node_bitmap,
+ 					     preemptor->license_list,
+ 					     preemptee) &&
+@@ -4797,6 +4876,10 @@ static void _launch_txn_add_preempt_status(
+ 						    preemptee)))
+ 			continue;
+ 
++		_launch_txn_add_blocker_nodes(status, planned_node_bitmap,
++					      preemptee);
++		if (_het_job_id_in_list(status->blocker_job_ids, *job_id))
++			continue;
+ 		_het_job_append_job_id(&status->blocker_job_ids, *job_id);
+ 		status->blocker_count++;
+ 		if (!preemptee->preempt_time && !IS_JOB_COMPLETING(preemptee)) {
+@@ -4820,6 +4903,32 @@ static void _launch_txn_add_preempt_status(
+ 	list_iterator_destroy(iter);
+ }
+ 
++static void _launch_txn_append_blocker_nodes(
++	char **comment, launch_preempt_status_t *status)
++{
++	char *nodes;
++	int node_count;
++
++	if (!comment || !*comment || !status || !status->blocker_node_bitmap)
++		return;
++	node_count = bit_set_count(status->blocker_node_bitmap);
++	if (!node_count)
++		return;
++
++	nodes = bitmap2node_name(status->blocker_node_bitmap);
++	if (!nodes)
++		return;
++	if (strlen(nodes) > LAUNCH_TXN_COMMENT_NODE_CHARS) {
++		xstrfmtcat(*comment, "; blocker node%s %.*s... (truncated)",
++			   (node_count == 1) ? "" : "s",
++			   LAUNCH_TXN_COMMENT_NODE_CHARS, nodes);
++	} else {
++		xstrfmtcat(*comment, "; blocker node%s %s",
++			   (node_count == 1) ? "" : "s", nodes);
++	}
++	xfree(nodes);
++}
++
+ static char *_launch_txn_make_system_comment(
+ 	launch_preempt_status_t *status, time_t now, time_t launch_start,
+ 	int commit_timeout, bool irrevocable)
+@@ -4880,6 +4989,7 @@ static char *_launch_txn_make_system_comment(
+ 		xstrfmtcat(comment,
+ 			   LAUNCH_TXN_SYSTEM_COMMENT_PREFIX "pinned plan ready");
+ 	}
++	_launch_txn_append_blocker_nodes(&comment, status);
+ 
+ 	if (irrevocable) {
+ 		if (status->blocker_count)
+@@ -5011,6 +5121,7 @@ static void _job_launch_update_status(job_record_t *job_ptr,
+ 	if (!job_ptr || !launch)
+ 		return;
+ 
++	_launch_txn_set_sched_nodes(job_ptr, launch->planned_node_bitmap);
+ 	_launch_txn_add_preempt_status(&status, job_ptr,
+ 				       launch->planned_node_bitmap,
+ 				       launch->planned_preemptee_job_ids, now);
+@@ -5023,6 +5134,7 @@ static void _job_launch_update_status(job_record_t *job_ptr,
+ 		&status, now, launch->launch_start, bf_job_commit_timeout, false);
+ 	_launch_txn_set_system_comment(job_ptr, comment);
+ 	xfree(comment);
++	FREE_NULL_BITMAP(status.blocker_node_bitmap);
+ 	FREE_NULL_LIST(status.blocker_job_ids);
+ }
+ 
+@@ -5396,6 +5508,7 @@ static void _job_launch_update_cleanup_status(job_record_t *job_ptr,
+ 	if (!job_ptr || !launch)
+ 		return;
+ 
++	_launch_txn_set_sched_nodes(job_ptr, launch->planned_node_bitmap);
+ 	_launch_txn_add_preempt_status(&status, job_ptr,
+ 				       launch->planned_node_bitmap,
+ 				       launch->planned_preemptee_job_ids, now);
+@@ -5409,6 +5522,7 @@ static void _job_launch_update_cleanup_status(job_record_t *job_ptr,
+ 		xstrfmtcat(comment, "; detail: %s", launch->failure_reason);
+ 	_launch_txn_set_system_comment(job_ptr, comment);
+ 	xfree(comment);
++	FREE_NULL_BITMAP(status.blocker_node_bitmap);
+ 	FREE_NULL_LIST(status.blocker_job_ids);
+ }
+ 
+@@ -5441,6 +5555,7 @@ static void _job_launch_schedule_replan(job_launch_t *launch, time_t now,
+ 	if (!job_ptr || !IS_JOB_PENDING(job_ptr))
+ 		return;
+ 
++	_launch_txn_set_sched_nodes(job_ptr, NULL);
+ 	job_ptr->bf_launch_transaction = true;
+ 	if (job_ptr->bf_launch_replan_count >= bf_launch_max_replans) {
+ 		job_ptr->bf_launch_retry_after = 0;
+@@ -5717,6 +5832,7 @@ static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
+ 
+ 		if (rec->launch_started)
+ 			continue;
++		_launch_txn_set_sched_nodes(job_ptr, rec->planned_node_bitmap);
+ 		_launch_txn_add_preempt_status(
+ 			&status, job_ptr, rec->planned_node_bitmap,
+ 			rec->planned_preemptee_job_ids, now);
+@@ -5748,6 +5864,7 @@ static void _het_job_update_launch_status(het_job_map_t *map, time_t now,
+ 	}
+ 	list_iterator_destroy(iter);
+ 	xfree(comment);
++	FREE_NULL_BITMAP(status.blocker_node_bitmap);
+ 	FREE_NULL_LIST(status.blocker_job_ids);
+ }
+ 
+@@ -6081,6 +6198,8 @@ static void _het_job_schedule_replan(het_job_map_t *map, time_t now,
+ 				     const char *reason)
+ {
+ 	char *failure_reason;
++	het_job_rec_t *rec;
++	list_itr_t *iter;
+ 
+ 	if (!map)
+ 		return;
+@@ -6104,6 +6223,10 @@ static void _het_job_schedule_replan(het_job_map_t *map, time_t now,
+ 	}
+ 	map->prev_start = map->retry_after;
+ 	_het_job_launch_rebuild_bitmap();
++	iter = list_iterator_create(map->het_job_rec_list);
++	while ((rec = list_next(iter)))
++		_launch_txn_set_sched_nodes(_het_job_rec_job_ptr(map, rec), NULL);
++	list_iterator_destroy(iter);
+ 	_het_job_set_replan_status(map, now, reason);
+ 	info("Hetjob %u launch transaction cleanup complete; state=%s replan=%u/%d",
+ 	     map->het_job_id,
+

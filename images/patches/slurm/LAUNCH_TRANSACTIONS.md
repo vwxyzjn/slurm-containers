@@ -297,6 +297,8 @@ The combined patch stack is intended to maintain these invariants:
     scheduler.
 14. QOS grace time remains authoritative; node ownership, cleanup, and replan cooldown do not
     shorten or bypass it.
+15. While a transaction owns nodes, each pending owner exposes its exact committed bitmap through
+    `SchedNodeList`; releasing that ownership clears the transaction-owned value.
 
 These guarantees do not make launch unconditional. A node can fail, be drained, lose required
 features, or become invalid for a reservation. Before preemption starts, such a validation failure
@@ -324,8 +326,18 @@ preempt only one allocation of a multi-node victim job.
 - `Reason=... blocked after ... failed replans`: the configured replacement-plan limit was reached;
   cancel and resubmit after operator review to authorize another victim wave.
 - `SystemComment=LaunchTxn: ... grace ...`: QOS grace is currently the expected wait.
+- `SchedNodeList=...`: the exact nodes currently committed to that ordinary job or hetjob
+  component. This remains stable through grace and cleanup; it is not a fresh capacity estimate.
+- `SystemComment=LaunchTxn: ... blocker node(s) ...`: the subset of committed nodes still occupied
+  by tracked victim jobs. A long compressed expression is explicitly truncated in the comment;
+  `SchedNodeList` still contains the full committed plan.
 - `SystemComment=LaunchTxn: preemption complete; waiting for pinned nodes to finish cleanup ...`:
   victim records cleared, but the exact launch still returns `ESLURM_NODES_BUSY`.
+
+If a pending job reports `PreemptionPlanned`, `Preempting`, or `HetjobPartialLaunch` without a
+`SchedNodeList`, treat that as an observability bug and capture `scontrol show job`, controller
+logs, and the timestamp. Once a transaction enters bounded-replan cooldown, the old
+`SchedNodeList` should disappear because those nodes are no longer owned.
 
 ## Regression Matrix
 
@@ -345,9 +357,11 @@ Before production rollout, exercise at least these cases and inspect controller 
 | Cycle budget, RPC pressure, or a state-changing yield interrupts before a promoted handoff receives job-specific consideration | Active handoff survives and is promoted again; it is not discarded before its first consideration |
 | Pinned run-now victim simulation returns an error | No transaction is created, neither `_start_job()` nor any victim signal occurs for that attempt, and the handoff enters non-active cooldown instead of hot-looping or being immediately recreated |
 | Ordinary job, five-minute grace | Victims receive preemption once; owner starts on the pinned nodes after grace and cleanup |
+| Ordinary transaction during grace and cleanup | `SchedNodeList` continuously shows the full immutable plan; `SystemComment` names the currently blocked subset without changing scheduling behavior |
 | Later higher-priority job arrives during cleanup | Later job cannot acquire committed nodes; it uses other capacity or remains pending |
 | Ordinary transaction exceeds safety timeout after signaling victims | No new victims are selected; original victims drain, ownership releases, and the bounded replan cooldown begins |
 | Hetjob with multiple preempting components | Every component's planned victims are initiated before the first component starts |
+| Pending hetjob transaction is inspected | Each pending component shows its own committed `SchedNodeList`; the shared `SystemComment` aggregates blocker nodes across not-yet-started components |
 | Hetjob victims have exited but one component's GRES is still busy | No component starts until every exact component plan passes the run-now readiness barrier |
 | Hetjob component hits cleanup delay | Already-started components remain running; delayed component retries its exact bitmap |
 | Hetjob cancelled before any component starts | Ownership and transaction status clear |
