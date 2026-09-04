@@ -6,6 +6,17 @@ plans and owner-aware concurrency slots. See [ARRAY_PREEMPTION.md](ARRAY_PREEMPT
 for the design, validation, and rollout limits. Rebuild the controller and all
 Slurm plugins together; this is not a backfill-plugin-only update.
 
+Build the `controller-rebuilt-slurm` target in `images/Dockerfile` for this
+candidate. It preserves the digest-pinned `joblaunch9` runtime packaging
+(including private upstream nsscache), but replaces the complete Slurm install
+and Pyxis with builds from the patched source. The Slurm builder runs the
+launch-transaction regression harness before producing the image.
+
+```bash
+docker buildx build --platform linux/amd64 --target controller-rebuilt-slurm \
+  --load -t slurm-controller:joblaunch10-review -f images/Dockerfile images
+```
+
 This file explains the patches in this directory, why they exist, and reasons why they are not
 likely to be added to the upstream code.
 

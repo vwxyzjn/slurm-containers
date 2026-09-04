@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # SPDX-PackageName: slurm-containers
 ARG PARENT_IMAGE=ubuntu:22.04
+ARG CONTROLLER_RUNTIME_IMAGE=876143322689.dkr.ecr.us-east-1.amazonaws.com/slurm-controller@sha256:b1ac993c70ca45cf2ac914114006945f407581b0a32899b121ff55165828d93f
 # Slurm version can be release version (ex. 22.05.7) or full git commit sha
 ARG SLURM_VERSION=25.05.3
 ARG S6_OVERLAY_VERSION=3.2.1.0
@@ -567,3 +568,10 @@ RUN echo "/usr/share/sunk/bin/reboot.sh" > /usr/bin/reboot && \
 
 RUN echo "/usr/share/sunk/bin/reboot.sh" > /usr/sbin/reboot && \
   chmod +x /usr/sbin/reboot
+
+FROM $CONTROLLER_RUNTIME_IMAGE AS controller-rebuilt-slurm
+ARG SLURM_VERSION
+ARG PYXIS_VERSION
+COPY --from=slurm-builder /build/slurm-$SLURM_VERSION/INSTALLDIR/ /
+COPY --from=pyxis-builder /build/pyxis-${PYXIS_VERSION}/INSTALLDIR/ /
+RUN ldconfig
