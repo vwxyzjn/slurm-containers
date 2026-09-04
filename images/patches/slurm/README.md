@@ -1,5 +1,11 @@
 # Slurm Patches
 
+The next controller candidate adds `0037-array-launch-transactions.patch` to
+the `joblaunch9` stack. It gives array tasks independent, bounded preemption
+plans and owner-aware concurrency slots. See [ARRAY_PREEMPTION.md](ARRAY_PREEMPTION.md)
+for the design, validation, and rollout limits. Rebuild the controller and all
+Slurm plugins together; this is not a backfill-plugin-only update.
+
 This file explains the patches in this directory, why they exist, and reasons why they are not
 likely to be added to the upstream code.
 

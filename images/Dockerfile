@@ -161,6 +161,8 @@ RUN mkdir /build/slurm-$SLURM_VERSION/INSTALLDIR && \
   make install DESTDIR=/build/slurm-$SLURM_VERSION/INSTALLDIR && \
   make install-contrib DESTDIR=/build/slurm-$SLURM_VERSION/INSTALLDIR
 
+RUN bash testsuite/slurm_unit/backfill/test_launch_transactions.sh
+
 ## Install pyxis
 ## Requires enroot version 3.1.0
 ## Requires spank.h from deployed slurm version
