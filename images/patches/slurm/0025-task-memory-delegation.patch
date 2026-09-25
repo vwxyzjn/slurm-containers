@@ -1,0 +1,579 @@
+diff --git a/doc/man/man5/cgroup.conf.5 b/doc/man/man5/cgroup.conf.5
+index 31cba7f..df6655a 100644
+--- a/doc/man/man5/cgroup.conf.5
++++ b/doc/man/man5/cgroup.conf.5
+@@ -97,6 +97,30 @@ enabled are io, pids, rdma, hugetlb and misc or all. If they do not exist in the
+ system an error is logged. Only for cgroup/v2.
+ .IP
+
++.TP
++\fBEnableTaskDelegation\fR=\fI<yes|no>\fR
++Allow tasks that explicitly request \fBSLURM_CGROUP_DELEGATE=memory\fR in
++their launch environment to manage memory cgroups below their Slurm task cgroup.
++The default is no. Requires cgroup/v2 and an available memory controller.
++Slurm keeps the task cgroup and its limits root-owned, creates a delegated
++subtree owned by the job user, and starts the task in its delegated/main leaf.
++Only the memory controller is delegated. Descendant cgroups remain subject to
++all ancestor limits, CPU affinity, and device restrictions.
++Slurm recursively tracks and removes descendants for opted-in tasks.
++Each task is limited to 258 descendants and a depth of 6 below its task cgroup.
++An invalid request or setup failure fails the task instead of granting partial
++delegation. This does not automatically impose a memory cap: the application
++must create a child cgroup, set memory.max (and memory.swap.max if appropriate),
++and move a new child process into it before that process allocates memory.
++For sibling survival after a child OOM, disable OOMKillStep for the step
++(e.g. srun --oom-kill-step=0). Slurm still reports descendant OOM events.
++Delegation is cooperative between processes sharing the job's Unix user ID;
++it does not isolate mutually untrusted processes with that same ID.
++Slurmd and slurmstepd must use matching patched binaries. Restart slurmd after
++installing them and enabling this option. Containerized tasks also need a
++writable view of their delegated subtree; this option does not alter mounts.
++.IP
++
+ .SH "TASK/CGROUP PLUGIN"
+
+ .LP
+diff --git a/src/interfaces/cgroup.c b/src/interfaces/cgroup.c
+index c83ea39..c1a4d84 100644
+--- a/src/interfaces/cgroup.c
++++ b/src/interfaces/cgroup.c
+@@ -201,6 +201,7 @@ static void _init_slurm_cgroup_conf(void)
+ 	slurm_cgroup_conf.constrain_ram_space = false;
+ 	slurm_cgroup_conf.constrain_swap_space = false;
+ 	slurm_cgroup_conf.enable_controllers = false;
++	slurm_cgroup_conf.enable_task_delegation = false;
+ 	slurm_cgroup_conf.enable_extra_controllers = NULL;
+ 	slurm_cgroup_conf.ignore_systemd = false;
+ 	slurm_cgroup_conf.ignore_systemd_on_failure = false;
+@@ -252,6 +253,7 @@ static void _pack_cgroup_conf(buf_t *buffer)
+ 	packstr(slurm_cgroup_conf.enable_extra_controllers, buffer);
+ 	packbool(slurm_cgroup_conf.signal_children_processes, buffer);
+ 	pack64(slurm_cgroup_conf.systemd_timeout, buffer);
++	packbool(slurm_cgroup_conf.enable_task_delegation, buffer);
+ }
+
+ static int _unpack_cgroup_conf(buf_t *buffer)
+@@ -297,6 +299,7 @@ static int _unpack_cgroup_conf(buf_t *buffer)
+ 	safe_unpackstr(&slurm_cgroup_conf.enable_extra_controllers, buffer);
+ 	safe_unpackbool(&slurm_cgroup_conf.signal_children_processes, buffer);
+ 	safe_unpack64(&slurm_cgroup_conf.systemd_timeout, buffer);
++	safe_unpackbool(&slurm_cgroup_conf.enable_task_delegation, buffer);
+
+ 	return SLURM_SUCCESS;
+
+@@ -333,6 +336,7 @@ static void _read_slurm_cgroup_conf(void)
+ 		{"IgnoreSystemd", S_P_BOOLEAN},
+ 		{"IgnoreSystemdOnFailure", S_P_BOOLEAN},
+ 		{"EnableControllers", S_P_BOOLEAN},
++		{"EnableTaskDelegation", S_P_BOOLEAN},
+ 		{"EnableExtraControllers", S_P_STRING},
+ 		{"SignalChildrenProcesses", S_P_BOOLEAN},
+ 		{"SystemdTimeout", S_P_UINT64},
+@@ -436,6 +440,8 @@ static void _read_slurm_cgroup_conf(void)
+ 			    "IgnoreSystemdOnFailure", tbl)))
+ 			slurm_cgroup_conf.ignore_systemd_on_failure = false;
+
++		(void) s_p_get_boolean(&slurm_cgroup_conf.enable_task_delegation,
++				      "EnableTaskDelegation", tbl);
+ 		(void) s_p_get_boolean(&slurm_cgroup_conf.enable_controllers,
+ 				       "EnableControllers", tbl);
+ 		if (s_p_get_string(&tmp_str, "EnableExtraControllers", tbl)) {
+@@ -627,6 +633,8 @@ extern list_t *cgroup_get_conf_list(void)
+ 			  cg_conf->ignore_systemd);
+ 	add_key_pair_bool(cgroup_conf_l, "IgnoreSystemdOnFailure",
+ 			  cg_conf->ignore_systemd_on_failure);
++	add_key_pair_bool(cgroup_conf_l, "EnableTaskDelegation",
++			  cg_conf->enable_task_delegation);
+ 	add_key_pair_bool(cgroup_conf_l, "EnableControllers",
+ 			  cg_conf->enable_controllers);
+ 	add_key_pair(cgroup_conf_l, "EnableExtraControllers", "%s",
+@@ -789,6 +797,13 @@ extern int cgroup_g_init(void)
+ 		}
+ 	}
+
++	if (slurm_cgroup_conf.enable_task_delegation &&
++	    xstrcmp(type, "cgroup/v2")) {
++		error("EnableTaskDelegation requires cgroup/v2");
++		rc = SLURM_ERROR;
++		goto done;
++	}
++
+ 	if (!xstrcmp(type, "disabled")) {
+ 		plugin_inited = PLUGIN_NOOP;
+ 		goto done;
+diff --git a/src/interfaces/cgroup.h b/src/interfaces/cgroup.h
+index d04f1bc..ebe9ffc 100644
+--- a/src/interfaces/cgroup.h
++++ b/src/interfaces/cgroup.h
+@@ -186,6 +186,7 @@ typedef struct {
+ 	bool constrain_ram_space;
+ 	bool constrain_swap_space;
+ 	bool enable_controllers;
++	bool enable_task_delegation;
+ 	char *enable_extra_controllers;
+ 	bool ignore_systemd;
+ 	bool ignore_systemd_on_failure;
+diff --git a/src/plugins/cgroup/v2/Makefile.am b/src/plugins/cgroup/v2/Makefile.am
+index 3dc7d36..91c9554 100644
+--- a/src/plugins/cgroup/v2/Makefile.am
++++ b/src/plugins/cgroup/v2/Makefile.am
+@@ -11,6 +11,7 @@ pkglib_LTLIBRARIES = cgroup_v2.la
+ # Cgroup v2 plugin.
+ cgroup_v2_la_SOURCES =	\
+ 	cgroup_v2.c	\
++	task_delegation.h	\
+ 	ebpf.c		\
+ 	ebpf.h		\
+ 	cgroup_dbus.c	\
+diff --git a/src/plugins/cgroup/v2/Makefile.in b/src/plugins/cgroup/v2/Makefile.in
+index 7dbc3f8..55cba0b 100644
+--- a/src/plugins/cgroup/v2/Makefile.in
++++ b/src/plugins/cgroup/v2/Makefile.in
+@@ -523,6 +523,7 @@ pkglib_LTLIBRARIES = cgroup_v2.la
+ # Cgroup v2 plugin.
+ cgroup_v2_la_SOURCES = \
+ 	cgroup_v2.c	\
++	task_delegation.h	\
+ 	ebpf.c		\
+ 	ebpf.h		\
+ 	cgroup_dbus.c	\
+diff --git a/src/plugins/cgroup/v2/cgroup_v2.c b/src/plugins/cgroup/v2/cgroup_v2.c
+index e511cdc..0e5ad3c 100644
+--- a/src/plugins/cgroup/v2/cgroup_v2.c
++++ b/src/plugins/cgroup/v2/cgroup_v2.c
+@@ -50,6 +50,7 @@
+
+ #include "src/common/bitstring.h"
+ #include "src/common/fd.h"
++#include "src/common/env.h"
+ #include "src/common/list.h"
+ #include "src/common/log.h"
+ #include "src/common/timers.h"
+@@ -62,6 +63,7 @@
+ #include "src/plugins/cgroup/common/cgroup_common.h"
+ #include "src/plugins/cgroup/v2/cgroup_dbus.h"
+ #include "src/plugins/cgroup/v2/ebpf.h"
++#include "src/plugins/cgroup/v2/task_delegation.h"
+
+ #define DEFAULT_SYSTEM_CGSLICE "system.slice"
+ #define SYSTEM_CGSCOPE "slurmstepd"
+@@ -98,12 +100,15 @@ static char *ctl_names[] = {
+
+ typedef struct {
+ 	xcgroup_t task_cg;
++	bool delegated;
++	bool delegation_ready;
+ 	uint32_t taskid;
+ 	bpf_program_t p;
+ } task_cg_info_t;
+
+ typedef struct {
+ 	int npids;
++	int capacity;
+ 	pid_t *pids;
+ } foreach_pid_array_t;
+
+@@ -666,10 +671,77 @@ static int _setup_controllers()
+ 				int_cg_ns.avail_controllers);
+ }
+
++static int _delegation_requested(stepd_step_rec_t *step)
++{
++	char *value;
++
++	if (!step || !step->env ||
++	    !(value = getenvp(step->env, "SLURM_CGROUP_DELEGATE")))
++		return 0;
++	if (strcmp(value, "memory")) {
++		error("SLURM_CGROUP_DELEGATE must be 'memory' when set");
++		return -1;
++	}
++	if (!slurm_cgroup_conf.enable_task_delegation) {
++		error("SLURM_CGROUP_DELEGATE requires EnableTaskDelegation=yes in cgroup.conf");
++		return -1;
++	}
++	return 1;
++}
++
++static int _collect_delegated_pid(pid_t pid, void *arg)
++{
++	foreach_pid_array_t *a = arg;
++
++	if (a->npids == a->capacity) {
++		if (a->capacity > INT_MAX - 64) {
++			errno = EOVERFLOW;
++			return -1;
++		}
++		a->capacity += 64;
++		xrealloc(a->pids, sizeof(*a->pids) * a->capacity);
++	}
++	a->pids[a->npids++] = pid;
++	return 0;
++}
++
++static int _task_pids(task_cg_info_t *t, pid_t **pids, int *npids)
++{
++	foreach_pid_array_t a = { 0 };
++	int fd, rc;
++
++	if (!t->delegated)
++		return common_cgroup_get_pids(&t->task_cg, pids, npids);
++	fd = open(t->task_cg.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return SLURM_ERROR;
++	rc = _deleg_walk(fd, _collect_delegated_pid, &a, false);
++	close(fd);
++	if (rc) {
++		xfree(a.pids);
++		return SLURM_ERROR;
++	}
++	*pids = a.pids;
++	*npids = a.npids;
++	return SLURM_SUCCESS;
++}
++
+ static int _rmdir_task(void *x, void *arg)
+ {
+ 	task_cg_info_t *t = (task_cg_info_t *) x;
+
++	if (t->delegated) {
++		int fd = open(t->task_cg.path,
++			      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++		if (fd < 0) {
++			if (errno != ENOENT)
++				error("Cannot open delegated task %s: %m", t->task_cg.path);
++		} else {
++			if (_deleg_cleanup(fd))
++				error("Cannot clean delegated task %s: %m", t->task_cg.path);
++			close(fd);
++		}
++	}
+ 	if (common_cgroup_delete(&t->task_cg) != SLURM_SUCCESS)
+ 		log_flag(CGROUP, "Failed to delete %s: %m", t->task_cg.path);
+
+@@ -712,7 +784,8 @@ static int _get_task_pids(void *x, void *key)
+ 	int npids = 0;
+
+ 	xassert(pid_array);
+-	common_cgroup_get_pids(&task_cg_info->task_cg, &pids, &npids);
++	if (_task_pids(task_cg_info, &pids, &npids) != SLURM_SUCCESS)
++		return SLURM_ERROR;
+
+ 	if (pid_array->pids) {
+ 		xrecalloc(pid_array->pids, (pid_array->npids + npids),
+@@ -738,7 +811,7 @@ static int _find_pid_task(void *x, void *key)
+ 	int npids = 0;
+ 	bool found = false;
+
+-	if (common_cgroup_get_pids(&task_cg_info->task_cg, &pids, &npids) !=
++	if (_task_pids(task_cg_info, &pids, &npids) !=
+ 	    SLURM_SUCCESS)
+ 		return false;
+
+@@ -1933,6 +2006,9 @@ extern int cgroup_p_step_create(cgroup_ctl_type_t ctl, stepd_step_rec_t *step)
+ 	char *new_path = NULL;
+ 	char tmp_char[64];
+
++	if (_delegation_requested(step) < 0)
++		return SLURM_ERROR;
++
+ 	/*
+ 	 * Lock the root cgroup so we don't race with other steps that are being
+ 	 * terminated and trying to destroy the job_x directory.
+@@ -2097,7 +2173,10 @@ extern int cgroup_p_step_get_pids(pid_t **pids, int *npids)
+ 	common_cgroup_get_pids(&int_cg[CG_LEVEL_STEP_SLURM],
+ 			       &pid_array.pids, &pid_array.npids);
+
+-	list_for_each(task_list, _get_task_pids, &pid_array);
++	if (list_for_each(task_list, _get_task_pids, &pid_array) < 0) {
++		xfree(pid_array.pids);
++		return SLURM_ERROR;
++	}
+ 	*npids = pid_array.npids;
+ 	*pids = pid_array.pids;
+
+@@ -2751,6 +2830,10 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t ctl, stepd_step_rec_t *step,
+ 	task_cg_info_t *task_cg_info;
+ 	char *task_cg_path = NULL;
+ 	bool need_to_add = false;
++	int delegate = _delegation_requested(step);
++
++	if (delegate < 0)
++		return SLURM_ERROR;
+
+ 	/* Ignore any possible movement of slurmstepd */
+ 	if (pid == getpid())
+@@ -2807,6 +2890,36 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t ctl, stepd_step_rec_t *step,
+
+ 		/* Add the cgroup to the list now that it is initialized. */
+ 		list_append(task_list, task_cg_info);
++		if ((delegate > 0) && (task_id != task_special_id)) {
++			int fd = open(task_cg_info->task_cg.path,
++				      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++			int rc;
++
++			/* Mark before setup so error cleanup removes partial trees. */
++			task_cg_info->delegated = true;
++			if (fd < 0)
++				return SLURM_ERROR;
++			rc = _deleg_prepare(fd, step->uid, step->gid);
++			close(fd);
++			if (rc) {
++				error("Cannot delegate task %u memory cgroup: %m", task_id);
++				return SLURM_ERROR;
++			}
++			task_cg_info->delegation_ready = true;
++		}
++	}
++
++	if (task_cg_info->delegated) {
++		xcgroup_t leaf = { 0 };
++		int rc;
++
++		if (!task_cg_info->delegation_ready)
++			return SLURM_ERROR;
++		leaf.path = xstrdup_printf("%s/" DELEGATION_LEAF,
++					  task_cg_info->task_cg.path);
++		rc = common_cgroup_move_process(&leaf, pid);
++		xfree(leaf.path);
++		return rc;
+ 	}
+
+ 	/* Attach the pid to the corresponding step_x/task_y cgroup */
+diff --git a/src/plugins/cgroup/v2/task_delegation.h b/src/plugins/cgroup/v2/task_delegation.h
+new file mode 100644
+index 0000000..bb614f4
+--- /dev/null
++++ b/src/plugins/cgroup/v2/task_delegation.h
+@@ -0,0 +1,231 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Memory-only delegation below a Slurm-owned task cgroup. */
++#ifndef _TASK_DELEGATION_H
++#define _TASK_DELEGATION_H
++
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <linux/magic.h>
++#include <sys/vfs.h>
++
++#define DELEGATION_DIR "delegated"
++#define DELEGATION_LEAF "delegated/main"
++#define DELEGATION_MAX_DESCENDANTS "258"
++#define DELEGATION_MAX_DEPTH "6"
++
++static int _deleg_open_dir(int parent, const char *name)
++{
++	return openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++}
++
++static int _deleg_write(int dir, const char *name, const char *value)
++{
++	int fd, rc = -1, saved;
++	size_t len = strlen(value);
++	ssize_t n;
++
++	fd = openat(dir, name, O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	do {
++		n = write(fd, value, len);
++	} while ((n < 0) && (errno == EINTR));
++	if (n == (ssize_t) len)
++		rc = 0;
++	else if (n >= 0)
++		errno = EIO;
++	saved = errno;
++	close(fd);
++	errno = saved;
++	return rc;
++}
++
++static int _deleg_chown(int dir, uid_t uid, gid_t gid)
++{
++	const char *files[] = {
++		"cgroup.procs", "cgroup.threads", "cgroup.subtree_control"
++	};
++	size_t i;
++
++	/* Never chown memory.max, the limits on the subtree, or any ancestor. */
++	for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		int fd = openat(dir, files[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++		int rc, saved;
++
++		if (fd < 0)
++			return -1;
++		rc = fchown(fd, uid, gid);
++		saved = errno;
++		close(fd);
++		if (rc) {
++			errno = saved;
++			return -1;
++		}
++	}
++	/* Hand over the directory last, after all root-owned setup is complete. */
++	return fchown(dir, uid, gid);
++}
++
++static int _deleg_check_fs(int fd)
++{
++	struct statfs fs;
++
++	if (fstatfs(fd, &fs))
++		return -1;
++	if (fs.f_type != CGROUP2_SUPER_MAGIC) {
++		errno = EINVAL;
++		return -1;
++	}
++	return 0;
++}
++
++/* Called on a newly-created, still-empty task cgroup, before user exec. */
++static int _deleg_prepare(int task, uid_t uid, gid_t gid)
++{
++	int dir = -1, leaf = -1, rc = -1, saved;
++	struct stat st;
++
++	if (_deleg_check_fs(task) || fstat(task, &st))
++		return -1;
++	if (st.st_uid || (st.st_mode & 0022)) {
++		errno = EPERM;
++		return -1;
++	}
++	/* Bound even a job that never cooperates with directory cleanup. */
++	if (_deleg_write(task, "cgroup.max.descendants", DELEGATION_MAX_DESCENDANTS) ||
++	    _deleg_write(task, "cgroup.max.depth", DELEGATION_MAX_DEPTH) ||
++	    _deleg_write(task, "cgroup.subtree_control", "+memory") ||
++	    mkdirat(task, DELEGATION_DIR, 0755))
++		return -1;
++	if ((dir = _deleg_open_dir(task, DELEGATION_DIR)) < 0)
++		goto out;
++	if (_deleg_write(dir, "cgroup.subtree_control", "+memory") ||
++	    mkdirat(dir, "main", 0755))
++		goto out;
++	if ((leaf = _deleg_open_dir(dir, "main")) < 0)
++		goto out;
++	if (_deleg_chown(leaf, uid, gid) || _deleg_chown(dir, uid, gid))
++		goto out;
++	rc = 0;
++out:
++	saved = errno;
++	if (leaf >= 0)
++		close(leaf);
++	if (dir >= 0)
++		close(dir);
++	errno = saved;
++	return rc;
++}
++
++/* Traverse by directory descriptors, never by a user-controlled path. */
++static int _deleg_walk(int dir, int (*emit)(pid_t, void *), void *arg,
++		       bool remove_children)
++{
++	struct dirent *entry;
++	DIR *stream;
++	int fd, rc = 0, saved;
++
++	if (emit) {
++		FILE *procs;
++		long pid;
++		int scan;
++
++		fd = openat(dir, "cgroup.procs", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++		if (fd < 0)
++			return (errno == ENOENT) ? 0 : -1;
++		if (!(procs = fdopen(fd, "r"))) {
++			close(fd);
++			return -1;
++		}
++		while ((scan = fscanf(procs, "%ld", &pid)) == 1) {
++			if ((pid <= 0) || (pid > INT_MAX)) {
++				rc = -1;
++				errno = EINVAL;
++				break;
++			}
++			if ((rc = emit((pid_t) pid, arg)))
++				break;
++		}
++		if (!rc && ((scan != EOF) || ferror(procs))) {
++			rc = -1;
++			errno = EIO;
++		}
++		saved = errno;
++		fclose(procs);
++		errno = saved;
++		if (rc)
++			return rc;
++	}
++	fd = _deleg_open_dir(dir, ".");
++	if (fd < 0)
++		return -1;
++	if (!(stream = fdopendir(fd))) {
++		close(fd);
++		return -1;
++	}
++	for (;;) {
++		struct stat st;
++		int child;
++
++		errno = 0;
++		entry = readdir(stream);
++		if (!entry) {
++			if (errno)
++				rc = -1;
++			break;
++		}
++		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
++			continue;
++		if (fstatat(dir, entry->d_name, &st, AT_SYMLINK_NOFOLLOW)) {
++			if (errno == ENOENT)
++				continue;
++			rc = -1;
++			break;
++		}
++		if (!S_ISDIR(st.st_mode))
++			continue;
++		child = _deleg_open_dir(dir, entry->d_name);
++		if (child < 0) {
++			if (errno == ENOENT)
++				continue;
++			rc = -1;
++			break;
++		}
++		if (remove_children && fchown(child, 0, 0))
++			rc = -1;
++		else
++			rc = _deleg_walk(child, emit, arg, remove_children);
++		saved = errno;
++		close(child);
++		errno = saved;
++		if (rc)
++			break;
++		if (remove_children && unlinkat(dir, entry->d_name, AT_REMOVEDIR) &&
++		    (errno != ENOENT)) {
++			rc = -1;
++			break;
++		}
++	}
++	saved = errno;
++	closedir(stream);
++	errno = saved;
++	return rc;
++}
++
++static int _deleg_cleanup(int task)
++{
++	/* Slurm has already killed and waited for the step's processes. */
++	if (_deleg_check_fs(task))
++		return -1;
++	return _deleg_walk(task, NULL, NULL, true);
++}
++
++#endif
