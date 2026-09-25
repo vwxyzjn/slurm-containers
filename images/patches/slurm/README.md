@@ -29,6 +29,7 @@ licenses.
   - [0022-move-persist-conn-shutdown.patch](#0022-move-persist-conn-shutdownpatch)
   - [0023-fail-bad-constraints.patch](#0023-fail-bad-constraintspatch)
   - [0024-fix-mem-spec-limit.patch](#0024-fix-mem-spec-limitpatch)
+  - [0025-task-memory-delegation.patch](#0025-task-memory-delegationpatch)
 
 ### 0001-max-server-threads
 
@@ -225,3 +226,12 @@ greater than the RealMemory value, which is the Pod memory request/limit.
 
 Fix: Preserve the existing calculation when physical memory is greater
 than the detected limit, and otherwise clamp MemSpecLimit to 0.
+
+### 0025-task-memory-delegation.patch
+
+Adds default-off, per-task cgroup v2 memory delegation for applications that need
+to cap individual child workers. Slurm retains the enclosing limits and gains
+recursive PID tracking and teardown for opted-in task subtrees. This requires
+runtime support beyond changing directory ownership; it is not available in the
+upstream version used by this image. See the [configuration, usage, and validation
+guide](../../../docs/task-memory-delegation.md) before enabling it.
