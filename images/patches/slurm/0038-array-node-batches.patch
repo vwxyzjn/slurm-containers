@@ -1,0 +1,947 @@
+diff --git a/doc/html/sched_config.shtml b/doc/html/sched_config.shtml
+index 171f79e3e2..728ca745a4 100644
+--- a/doc/html/sched_config.shtml
++++ b/doc/html/sched_config.shtml
+@@ -149,6 +149,15 @@ slot. The default is 20, with a range of 0 through 1000. Zero stops new array
+ preemption plans, not idle-resource starts or retries of existing plans.
+ Lowering the limit does not discard committed plans. Victim grace time and
+ ordinary non-array and heterogeneous launch transactions are unchanged.</LI>
++<LI><B>bf_max_job_array_node_batch=#</B> - Opt-in batching of compatible
++one-GPU, one-node tasks from one array on a shared node. The selector proves
++the combined resource request before tasks, slots and the sufficient victim
++set are committed. Only explicitly admitted task IDs share the node fence;
++each counts against the array limit and bf_max_job_array_launch. Victims keep
++their original grace periods. Members wait for the batch victim set to clear,
++then start independently without rolling back started tasks. Unsupported
++requests retain independent plans. Default 1 (disabled), range 1 through 32.
++Lowering the setting affects new batches only.</LI>
+ <LI><B>bf_interval=#</B> - Interval between backfill scheduling attempts.
+ Default value is 30 seconds.</LI>
+ <LI><B>bf_max_job_part=#</B> - Maximum number of jobs to initiate per partition
+diff --git a/doc/man/man5/slurm.conf.5 b/doc/man/man5/slurm.conf.5
+index 61fd3ad1b9..9fe5ac2cb2 100644
+--- a/doc/man/man5/slurm.conf.5
++++ b/doc/man/man5/slurm.conf.5
+@@ -4090,6 +4090,20 @@ does not discard existing plans. Victim QOS GraceTime is unchanged.
+ Default: 20, Min: 0, Max: 1000.
+ .IP
+ 
++.TP
++\fBbf_max_job_array_node_batch\fR=\#
++Opt-in maximum number of compatible one-GPU, one-node tasks from one array
++admitted together to a preemption plan on a shared node. The consumable-resource
++selector must prove that the combined CPU, memory and GPU request fits after
++preempting its sufficient victim set. Every admitted task consumes its own
++array concurrency slot and bf_max_job_array_launch slot before any victim signal.
++Only the admitted task IDs may share the node fence. All members wait for the
++batch victim set to clear; started members are not rolled back. Unsupported
++requests retain the ordinary independent-task path. Setting this to 1 disables
++new batches without discarding existing ones. Victim GraceTime is unchanged.
++Default: 1, Min: 1, Max: 32.
++.IP
++
+ .TP
+ \fBbf_max_job_array_resv\fR=\#
+ The maximum number of tasks from a job array for which the backfill scheduler
+diff --git a/src/plugins/sched/backfill/backfill.c b/src/plugins/sched/backfill/backfill.c
+index a3dc856007..9eeac39e38 100644
+--- a/src/plugins/sched/backfill/backfill.c
++++ b/src/plugins/sched/backfill/backfill.c
+@@ -213,6 +213,9 @@ typedef struct {
+ 	bitstr_t *planned_node_bitmap;
+ 	list_t *planned_resident_job_ids;
+ 	list_t *planned_preemptee_job_ids;
++	uint32_t *batch_members;
++	uint32_t batch_size;
++	char *batch_request;
+ } job_launch_t;
+ 
+ typedef struct {
+@@ -291,6 +294,7 @@ static int backfill_window = BACKFILL_WINDOW;
+ static int bf_job_part_count_reserve = 0;
+ static int bf_max_job_array_resv = BF_MAX_JOB_ARRAY_RESV;
+ static int bf_max_job_array_launch = BF_MAX_JOB_ARRAY_LAUNCH;
++static int bf_max_job_array_node_batch = 1;
+ static int bf_min_age_reserve = 0;
+ static int bf_node_space_size = 0;
+ static bool bf_running_job_reserve = false;
+@@ -354,6 +358,15 @@ static job_launch_t *_job_launch_begin(
+ 	bool use_prefer, bitstr_t *planned_node_bitmap,
+ 	list_t *planned_preemptee_job_ids);
+ static void _job_launch_clear(job_launch_t *launch, const char *reason);
++static job_launch_t *_job_launch_begin_array_batch(
++	job_record_t *job_ptr, part_record_t *part_ptr,
++	slurmdb_qos_rec_t *qos_ptr, slurmctld_resv_t *resv_ptr,
++	bool use_prefer, bitstr_t *planned_node_bitmap,
++	list_t *planned_preemptee_job_ids, resv_exc_t *resv_exc,
++	uint32_t original_time_limit);
++static char *_job_launch_batch_request(job_record_t *job_ptr);
++static bool _job_launch_batch_request_matches(job_record_t *job_ptr,
++					    job_launch_t *launch);
+ static void _job_launch_clear_expired(void);
+ static void _job_launch_del(void *x);
+ static void _job_launch_enter_cleanup(job_launch_t *launch,
+@@ -1206,6 +1219,17 @@ static void _load_config(void)
+ 	}
+ 
+ 	bf_launch_replan_delay = BF_LAUNCH_REPLAN_DELAY;
++	bf_max_job_array_node_batch = 1;
++	if ((tmp_ptr = xstrcasestr(sched_params,
++				 "bf_max_job_array_node_batch="))) {
++		tmp_val = strtol(tmp_ptr + strlen("bf_max_job_array_node_batch="),
++				 NULL, 10);
++		if ((tmp_val < 1) || (tmp_val > 32))
++			error("Invalid SchedulerParameters bf_max_job_array_node_batch: %ld",
++			      tmp_val);
++		else
++			bf_max_job_array_node_batch = tmp_val;
++	}
+ 	if ((tmp_ptr = xstrcasestr(sched_params,
+ 				   "bf_launch_replan_delay="))) {
+ 		bf_launch_replan_delay =
+@@ -3559,10 +3583,11 @@ later_start_set:
+ 				}
+ 				if (planned_preemptee_job_ids &&
+ 				    list_count(planned_preemptee_job_ids)) {
+-					job_launch = _job_launch_begin(
++					job_launch = _job_launch_begin_array_batch(
+ 						job_ptr, part_ptr, qos_ptr, resv_ptr,
+ 						use_prefer, avail_bitmap,
+-						planned_preemptee_job_ids);
++						planned_preemptee_job_ids, &resv_exc,
++						orig_time_limit);
+ 					if (launch_owner_job_id != job_ptr->job_id) {
+ 						job_record_t *pending_job_ptr =
+ 							find_job_record(launch_owner_job_id);
+@@ -3589,6 +3614,15 @@ later_start_set:
+ 			}
+ 
+ 			if (job_launch) {
++				if (!_job_launch_batch_request_matches(job_ptr,
++								      job_launch)) {
++					_job_launch_enter_cleanup(job_launch,
++						"array batch resource request changed");
++					_set_job_time_limit(job_ptr, orig_time_limit);
++					reservation_delete_resv_exc_parts(&resv_exc);
++					FREE_NULL_BITMAP(avail_bitmap);
++					continue;
++				}
+ 				FREE_NULL_BITMAP(resv_bitmap);
+ 				resv_bitmap = bit_copy(
+ 					job_launch->planned_node_bitmap);
+@@ -5060,6 +5094,8 @@ static void _job_launch_del(void *x)
+ 		job_ptr->bf_launch_transaction = false;
+ 	}
+ 	xfree(launch->failure_reason);
++	xfree(launch->batch_request);
++	xfree(launch->batch_members);
+ 	xfree(launch->part_name);
+ 	FREE_NULL_BITMAP(launch->planned_node_bitmap);
+ 	FREE_NULL_LIST(launch->planned_resident_job_ids);
+@@ -5172,6 +5208,9 @@ static void _job_launch_update_status(job_record_t *job_ptr,
+ 			      "Preempting" : "PreemptionPlanned");
+ 	comment = _launch_txn_make_system_comment(
+ 		&status, now, launch->launch_start, bf_job_commit_timeout, false);
++	if (launch->batch_size)
++		xstrfmtcat(comment, "; array batch %u, %u members",
++			   launch->batch_members[0], launch->batch_size);
+ 	_launch_txn_set_system_comment(job_ptr, comment);
+ 	xfree(comment);
+ 	FREE_NULL_BITMAP(status.blocker_node_bitmap);
+@@ -5363,6 +5402,10 @@ static bool _job_launch_validate(job_launch_t *launch, char **reason)
+ 		xstrfmtcat(*reason, "job is no longer pending");
+ 		return false;
+ 	}
++	if (!_job_launch_batch_request_matches(job_ptr, launch)) {
++		xstrfmtcat(*reason, "array batch resource request changed");
++		return false;
++	}
+ 
+ 	part_ptr = find_part_record(launch->part_name);
+ 	if (!part_ptr || !_job_part_valid(job_ptr, part_ptr)) {
+@@ -5418,11 +5461,20 @@ static bool _job_launch_validate(job_launch_t *launch, char **reason)
+ 
+ 	iter = list_iterator_create(job_list);
+ 	while ((blocker = list_next(iter))) {
++		bool batch_member = false;
++
+ 		if (!IS_JOB_RUNNING(blocker) && !IS_JOB_COMPLETING(blocker))
+ 			continue;
+ 		if (!_het_job_job_on_planned_nodes(launch->planned_node_bitmap,
+ 						   blocker))
+ 			continue;
++		for (uint32_t member = 0; member < launch->batch_size; member++) {
++			if (launch->batch_members[member] == blocker->job_id)
++				batch_member = true;
++		}
++		if (batch_member &&
++		    (blocker->array_job_id == job_ptr->array_job_id))
++			continue;
+ 		if (_het_job_id_in_list(launch->planned_preemptee_job_ids,
+ 					 blocker->job_id) ||
+ 		    _het_job_id_in_list(launch->planned_resident_job_ids,
+@@ -5439,11 +5491,11 @@ static bool _job_launch_validate(job_launch_t *launch, char **reason)
+ 	return true;
+ }
+ 
+-static job_launch_t *_job_launch_begin(
++static job_launch_t *_job_launch_begin_member(
+ 	job_record_t *job_ptr, part_record_t *part_ptr,
+ 	slurmdb_qos_rec_t *qos_ptr, slurmctld_resv_t *resv_ptr,
+ 	bool use_prefer, bitstr_t *planned_node_bitmap,
+-	list_t *planned_preemptee_job_ids)
++	list_t *planned_preemptee_job_ids, job_launch_t *batch_leader)
+ {
+ 	job_launch_t *launch;
+ 
+@@ -5453,7 +5505,18 @@ static job_launch_t *_job_launch_begin(
+ 	    !list_count(planned_preemptee_job_ids))
+ 		return NULL;
+ 
+-	if ((job_launch_node_bitmap &&
++	if (batch_leader) {
++		job_record_t *leader = find_job_record(batch_leader->job_id);
++
++		if (!leader || !job_ptr->array_recs ||
++		    !job_ptr->array_job_id ||
++		    (leader->array_job_id != job_ptr->array_job_id) ||
++		    (batch_leader->state != JOB_LAUNCH_COMMITTED) ||
++		    !bit_equal(planned_node_bitmap,
++			       batch_leader->planned_node_bitmap))
++			return NULL;
++	}
++	if ((!batch_leader && job_launch_node_bitmap &&
+ 	     bit_overlap_any(planned_node_bitmap, job_launch_node_bitmap)) ||
+ 	    (het_job_launch_node_bitmap &&
+ 	     bit_overlap_any(planned_node_bitmap,
+@@ -5508,6 +5571,228 @@ static job_launch_t *_job_launch_begin(
+ 	return launch;
+ }
+ 
++static job_launch_t *_job_launch_begin(
++	job_record_t *job_ptr, part_record_t *part_ptr,
++	slurmdb_qos_rec_t *qos_ptr, slurmctld_resv_t *resv_ptr,
++	bool use_prefer, bitstr_t *planned_node_bitmap,
++	list_t *planned_preemptee_job_ids)
++{
++	return _job_launch_begin_member(job_ptr, part_ptr, qos_ptr, resv_ptr,
++		use_prefer, planned_node_bitmap, planned_preemptee_job_ids, NULL);
++}
++
++static char *_job_launch_batch_request(job_record_t *job_ptr)
++{
++	job_details_t *details = job_ptr->details;
++	multi_core_data_t *multicore = details ? details->mc_ptr : NULL;
++	char *request;
++
++	if (!details || !multicore)
++		return NULL;
++	request = xstrdup_printf(
++		"%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
++		details->min_nodes, details->max_nodes,
++		details->orig_min_cpus, details->orig_max_cpus,
++		details->cpus_per_task, details->orig_cpus_per_task,
++		details->num_tasks, details->ntasks_per_node,
++		details->ntasks_per_tres, details->overcommit,
++		details->whole_node, details->share_res, details->core_spec,
++		details->orig_pn_min_cpus, details->pn_min_tmp_disk,
++		(unsigned long long) details->orig_pn_min_memory,
++		details->task_dist, multicore->boards_per_node,
++		multicore->sockets_per_board, multicore->sockets_per_node,
++		multicore->cores_per_socket, multicore->threads_per_core,
++		multicore->ntasks_per_board, multicore->ntasks_per_socket,
++		multicore->ntasks_per_core, multicore->plane_size,
++		job_ptr->tres_per_job, job_ptr->tres_per_node,
++		job_ptr->tres_per_socket, job_ptr->tres_per_task,
++		job_ptr->cpus_per_tres, job_ptr->mem_per_tres,
++		details->req_nodes, details->exc_nodes, details->features,
++		details->dependency, job_ptr->licenses);
++	return request;
++}
++
++static bool _job_launch_batch_request_matches(job_record_t *job_ptr,
++					    job_launch_t *launch)
++{
++	char *request;
++	bool matches;
++
++	if (!launch->batch_request)
++		return true;
++	request = _job_launch_batch_request(job_ptr);
++	matches = !xstrcmp(request, launch->batch_request);
++	xfree(request);
++	return matches;
++}
++
++static uint32_t _job_launch_batch_limit(job_record_t *job_ptr,
++				      bitstr_t *nodes)
++{
++	job_details_t *details = job_ptr->details;
++	job_array_struct_t *array = job_ptr->array_recs;
++	gres_state_t *gres;
++	gres_job_state_t *gres_job;
++	uint32_t limit;
++	uint64_t occupied;
++
++	if ((bf_max_job_array_node_batch < 2) || !array ||
++	    !job_ptr->array_job_id || job_ptr->het_job_id || !details ||
++	    !details->mc_ptr || (details->num_tasks != 1) ||
++	    (details->min_nodes != 1) || (details->max_nodes != 1) ||
++	    details->whole_node || details->overcommit ||
++	    details->depend_list || details->expanding_jobid ||
++	    details->arbitrary_tpn || details->pn_min_tmp_disk ||
++	    !details->pn_min_memory ||
++	    job_ptr->license_list || job_ptr->burst_buffer || job_ptr->fed_details ||
++	    (job_ptr->bit_flags & GRES_ENFORCE_BIND) ||
++	    !details->cpus_per_task || (details->cpus_per_task == NO_VAL16) ||
++	    (bit_set_count(nodes) != 1) ||
++	    xstrcmp(slurm_conf.select_type, "select/cons_tres") ||
++	    !job_ptr->gres_list_req || (list_count(job_ptr->gres_list_req) != 1))
++		return 1;
++	gres = list_peek(job_ptr->gres_list_req);
++	gres_job = gres->gres_data;
++	if (xstrcmp(gres->gres_name, "gpu") ||
++	    (gres->config_flags & GRES_CONF_SHARED) ||
++	    (gres_job->gres_per_task != 1) || gres_job->gres_per_socket ||
++	    (gres_job->gres_per_job > 1) || (gres_job->gres_per_node > 1) ||
++	    (details->mc_ptr->ntasks_per_socket &&
++	     (details->mc_ptr->ntasks_per_socket != NO_VAL16) &&
++	     (details->mc_ptr->ntasks_per_socket != INFINITE16)) ||
++	    (details->mc_ptr->ntasks_per_board &&
++	     (details->mc_ptr->ntasks_per_board != NO_VAL16) &&
++	     (details->mc_ptr->ntasks_per_board != INFINITE16)))
++		return 1;
++	if (job_ptr->bf_launch_array_slots >= bf_max_job_array_launch)
++		return 1;
++	limit = MIN((uint32_t) bf_max_job_array_node_batch, array->task_cnt);
++	limit = MIN(limit, bf_max_job_array_launch - job_ptr->bf_launch_array_slots);
++	occupied = (uint64_t) array->tot_run_tasks + job_ptr->bf_launch_array_slots;
++	if (array->max_run_tasks) {
++		if (occupied >= array->max_run_tasks)
++			return 1;
++		limit = MIN(limit, array->max_run_tasks - occupied);
++	}
++	return MAX(limit, 1);
++}
++
++static list_t *_job_launch_batch_probe(job_record_t *job_ptr,
++				      bitstr_t *nodes, uint32_t count,
++				      resv_exc_t *resv_exc, int *rc)
++{
++	job_record_t probe = *job_ptr;
++	job_details_t details = *job_ptr->details;
++	multi_core_data_t multicore = *details.mc_ptr;
++	gres_state_t *gres;
++	gres_job_state_t *gres_job;
++	list_t *victims;
++
++	*rc = ESLURM_NODES_BUSY;
++	if ((details.min_cpus > (NO_VAL / count)) ||
++	    (details.pn_min_cpus > (NO_VAL / count)) ||
++	    ((details.max_cpus != NO_VAL) &&
++	     (details.max_cpus > (NO_VAL / count))) ||
++	    (!(details.pn_min_memory & MEM_PER_CPU) &&
++	     (details.pn_min_memory > ((MEM_PER_CPU - 1) / count))))
++		return NULL;
++	probe.details = &details;
++	details.mc_ptr = &multicore;
++	details.num_tasks = count;
++	details.ntasks_per_node = count;
++	details.min_cpus *= count;
++	details.orig_min_cpus = details.min_cpus;
++	if (details.max_cpus != NO_VAL)
++		details.max_cpus *= count;
++	details.orig_max_cpus = details.max_cpus;
++	details.pn_min_cpus *= count;
++	details.orig_pn_min_cpus = details.pn_min_cpus;
++	if (!(details.pn_min_memory & MEM_PER_CPU))
++		details.pn_min_memory *= count;
++	details.orig_pn_min_memory = details.pn_min_memory;
++	probe.job_resrcs = NULL;
++	probe.node_bitmap_preempt = NULL;
++	probe.cpus_per_tres = xstrdup(job_ptr->cpus_per_tres);
++	probe.mem_per_tres = xstrdup(job_ptr->mem_per_tres);
++	probe.gres_list_req = gres_job_state_list_dup(job_ptr->gres_list_req);
++	probe.gres_list_req_accum = NULL;
++	gres = list_peek(probe.gres_list_req);
++	gres_job = gres->gres_data;
++	gres_job->gres_per_job *= count;
++	gres_job->gres_per_node *= count;
++	gres_job->total_gres = count;
++	victims = _het_job_select_planned_preemptee_ids(
++		&probe, nodes, 1, 1, 1, resv_exc, rc);
++	FREE_NULL_LIST(probe.gres_list_req);
++	FREE_NULL_LIST(probe.gres_list_req_accum);
++	FREE_NULL_BITMAP(probe.node_bitmap_preempt);
++	xfree(probe.cpus_per_tres);
++	xfree(probe.mem_per_tres);
++	return victims;
++}
++
++static job_launch_t *_job_launch_begin_array_batch(
++	job_record_t *job_ptr, part_record_t *part_ptr,
++	slurmdb_qos_rec_t *qos_ptr, slurmctld_resv_t *resv_ptr,
++	bool use_prefer, bitstr_t *planned_node_bitmap,
++	list_t *planned_preemptee_job_ids, resv_exc_t *resv_exc,
++	uint32_t original_time_limit)
++{
++	uint32_t count = _job_launch_batch_limit(job_ptr, planned_node_bitmap);
++	uint32_t members[32] = { 0 };
++	job_launch_t *plans[32] = { 0 };
++	uint32_t array_id = job_ptr->array_job_id;
++	uint32_t committed = 0;
++	list_t *victims = NULL;
++	int rc;
++
++	for (; count > 1; count--) {
++		victims = _job_launch_batch_probe(job_ptr, planned_node_bitmap,
++						count, resv_exc, &rc);
++		if ((rc == SLURM_SUCCESS) && victims && list_count(victims))
++			break;
++		FREE_NULL_LIST(victims);
++	}
++	if (count < 2)
++		return _job_launch_begin(job_ptr, part_ptr, qos_ptr, resv_ptr,
++			use_prefer, planned_node_bitmap, planned_preemptee_job_ids);
++	for (uint32_t member = 0; member < count; member++) {
++		job_record_t *owner = member ? find_job_record(array_id) : job_ptr;
++
++		if (!owner)
++			goto rollback;
++		if (member)
++			_set_job_time_limit(owner, original_time_limit);
++		plans[member] = _job_launch_begin_member(owner, part_ptr, qos_ptr,
++			resv_ptr, use_prefer, planned_node_bitmap, victims, plans[0]);
++		if (!plans[member])
++			goto rollback;
++		members[member] = owner->job_id;
++		committed++;
++	}
++	if (!bf_launch_txn_share_nodes(members, count))
++		goto rollback;
++	for (uint32_t member = 0; member < count; member++) {
++		job_record_t *owner = find_job_record(members[member]);
++
++		plans[member]->batch_members = xcalloc(count, sizeof(*members));
++		memcpy(plans[member]->batch_members, members,
++		       count * sizeof(*members));
++		plans[member]->batch_size = count;
++		plans[member]->batch_request = _job_launch_batch_request(owner);
++		_job_launch_update_status(owner, plans[member], time(NULL), false);
++	}
++	info("%pJ array node batch committed: %u tasks, %d planned preemptions",
++	     job_ptr, count, list_count(victims));
++	FREE_NULL_LIST(victims);
++	return plans[0];
++rollback:
++	for (uint32_t member = 0; member < committed; member++)
++		_job_launch_clear(plans[member], "array batch admission failed before signaling");
++	FREE_NULL_LIST(victims);
++	return NULL;
++}
++
+ static void _job_launch_clear(job_launch_t *launch, const char *reason)
+ {
+ 	if (!launch || !job_launch_list)
+diff --git a/src/slurmctld/node_scheduler.c b/src/slurmctld/node_scheduler.c
+index b8e4a3e91a..32b018fa55 100644
+--- a/src/slurmctld/node_scheduler.c
++++ b/src/slurmctld/node_scheduler.c
+@@ -126,6 +126,8 @@ enum {
+ typedef struct {
+ 	uint32_t owner_id;
+ 	bitstr_t *node_bitmap;
++	uint32_t *batch_members;
++	uint32_t batch_size;
+ } bf_launch_txn_nodes_t;
+ 
+ typedef struct {
+@@ -181,6 +183,7 @@ static void _bf_launch_txn_nodes_del(void *x)
+ 	if (!record)
+ 		return;
+ 	FREE_NULL_BITMAP(record->node_bitmap);
++	xfree(record->batch_members);
+ 	xfree(record);
+ }
+ 
+@@ -527,7 +530,7 @@ static bool _bf_launch_txn_should_defer_preemption(
+ extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
+ 				       bitstr_t *usable_node_mask)
+ {
+-	bf_launch_txn_nodes_t *record;
++	bf_launch_txn_nodes_t *record, *owner_record = NULL;
+ 	list_itr_t *iter;
+ 	uint32_t owner_id;
+ 
+@@ -543,7 +546,21 @@ extern void bf_launch_txn_filter_nodes(job_record_t *job_ptr,
+ 
+ 	iter = list_iterator_create(bf_launch_txn_nodes);
+ 	while ((record = list_next(iter))) {
+-		if (record->owner_id != owner_id)
++		if (record->owner_id == owner_id) {
++			owner_record = record;
++			break;
++		}
++	}
++	list_iterator_reset(iter);
++	while ((record = list_next(iter))) {
++		bool admitted = (record->owner_id == owner_id);
++
++		if (owner_record && owner_record->batch_size &&
++		    (owner_record->batch_size == record->batch_size) &&
++		    !memcmp(owner_record->batch_members, record->batch_members,
++			    record->batch_size * sizeof(*record->batch_members)))
++			admitted = true;
++		if (!admitted)
+ 			bit_and_not(usable_node_mask, record->node_bitmap);
+ 	}
+ 	list_iterator_destroy(iter);
+@@ -648,6 +665,8 @@ extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
+ 			continue;
+ 		FREE_NULL_BITMAP(record->node_bitmap);
+ 		record->node_bitmap = bit_copy(node_bitmap);
++		xfree(record->batch_members);
++		record->batch_size = 0;
+ 		list_iterator_destroy(iter);
+ 		slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
+ 		return;
+@@ -661,6 +680,61 @@ extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
+ 	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
+ }
+ 
++extern bool bf_launch_txn_share_nodes(uint32_t *members, uint32_t count)
++{
++	bf_launch_txn_nodes_t *records[32] = { 0 };
++	bf_launch_txn_nodes_t *record;
++	list_itr_t *iter;
++	uint32_t array_id = 0;
++	bool valid = false;
++
++	if (!members || (count < 2) || (count > 32))
++		return false;
++	for (uint32_t member = 0; member < count; member++) {
++		job_record_t *job_ptr = find_job_record(members[member]);
++
++		if (!job_ptr || !IS_JOB_PENDING(job_ptr) ||
++		    !job_ptr->bf_launch_transaction || !job_ptr->array_job_id ||
++		    job_ptr->het_job_id)
++			return false;
++		if (!array_id)
++			array_id = job_ptr->array_job_id;
++		if (array_id != job_ptr->array_job_id)
++			return false;
++		for (uint32_t prior = 0; prior < member; prior++) {
++			if (members[prior] == members[member])
++				return false;
++		}
++	}
++	slurm_mutex_lock(&bf_launch_txn_nodes_mutex);
++	if (!bf_launch_txn_nodes)
++		goto done;
++	iter = list_iterator_create(bf_launch_txn_nodes);
++	while ((record = list_next(iter))) {
++		for (uint32_t member = 0; member < count; member++) {
++			if (record->owner_id == members[member])
++				records[member] = record;
++		}
++	}
++	list_iterator_destroy(iter);
++	for (uint32_t member = 0; member < count; member++) {
++		if (!records[member] || records[member]->batch_size ||
++		    !bit_equal(records[0]->node_bitmap,
++			       records[member]->node_bitmap))
++			goto done;
++	}
++	for (uint32_t member = 0; member < count; member++) {
++		records[member]->batch_members = xcalloc(count, sizeof(*members));
++		memcpy(records[member]->batch_members, members,
++		       count * sizeof(*members));
++		records[member]->batch_size = count;
++	}
++	valid = true;
++done:
++	slurm_mutex_unlock(&bf_launch_txn_nodes_mutex);
++	return valid;
++}
++
+ /*
+  * _get_ntasks_per_core - Retrieve the value of ntasks_per_core from
+  *	the given job_details record.  If it wasn't set, return INFINITE16.
+diff --git a/src/slurmctld/node_scheduler.h b/src/slurmctld/node_scheduler.h
+index 326a82dd2a..0131c9e8b7 100644
+--- a/src/slurmctld/node_scheduler.h
++++ b/src/slurmctld/node_scheduler.h
+@@ -146,7 +146,8 @@ extern bool bf_launch_txn_overlap_nodes(bitstr_t *node_bitmap);
+ extern void bf_launch_txn_prune_handoffs(void);
+ extern void bf_launch_txn_release_nodes(uint32_t owner_id);
+ extern void bf_launch_txn_reserve_nodes(uint32_t owner_id,
+-					bitstr_t *node_bitmap);
++				      bitstr_t *node_bitmap);
++extern bool bf_launch_txn_share_nodes(uint32_t *members, uint32_t count);
+ 
+ /*
+  * select_nodes - select and allocate nodes to a specific job
+diff --git a/testsuite/slurm_unit/backfill/array_node_batch_test.c b/testsuite/slurm_unit/backfill/array_node_batch_test.c
+new file mode 100644
+index 0000000000..f7c8f23bc8
+--- /dev/null
++++ b/testsuite/slurm_unit/backfill/array_node_batch_test.c
+@@ -0,0 +1,326 @@
++#define main previous_tests_main
++#include "launch_transaction_test.c"
++#undef main
++
++static job_record_t *batch_victims[8];
++static uint32_t probe_capacity = 8;
++static bool reject_admission;
++
++list_t *__wrap_slurm_find_preemptable_jobs(job_record_t *job_ptr)
++{
++	list_t *candidates = list_create(NULL);
++
++	for (uint32_t victim = 0; victim < 8; victim++)
++		list_append(candidates, batch_victims[victim]);
++	return candidates;
++}
++
++int __wrap_select_g_job_test(job_record_t *job_ptr, bitstr_t *bitmap,
++	uint32_t min_nodes, uint32_t max_nodes, uint32_t req_nodes, uint16_t mode,
++	list_t *candidates, list_t **selected, resv_exc_t *resv_exc,
++	will_run_data_t *will_run)
++{
++	uint32_t count = job_ptr->details->num_tasks;
++	gres_state_t *gres = list_peek(job_ptr->gres_list_req);
++	gres_job_state_t *request = gres->gres_data;
++
++	REQUIRE(mode == SELECT_MODE_RUN_NOW);
++	REQUIRE(min_nodes == 1 && max_nodes == 1 && req_nodes == 1);
++	REQUIRE(bit_set_count(bitmap) == 1);
++	REQUIRE(job_ptr->details->min_cpus == 12 * count);
++	REQUIRE(job_ptr->details->cpus_per_task == 12);
++	REQUIRE(job_ptr->details->ntasks_per_node == count);
++	REQUIRE(request->gres_per_task == 1);
++	REQUIRE(request->total_gres == count);
++	if (job_ptr->details->pn_min_memory & MEM_PER_CPU)
++		REQUIRE(job_ptr->details->pn_min_memory == (MEM_PER_CPU | 4096));
++	else
++		REQUIRE(job_ptr->details->pn_min_memory == 131072 * count);
++	if (count > probe_capacity)
++		return ESLURM_NODES_BUSY;
++	*selected = list_create(NULL);
++	for (uint32_t victim = 0; victim < count; victim++)
++		list_append(*selected, batch_victims[victim]);
++	return SLURM_SUCCESS;
++}
++
++bool __real_bf_launch_txn_share_nodes(uint32_t *members, uint32_t count);
++
++bool __wrap_bf_launch_txn_share_nodes(uint32_t *members, uint32_t count)
++{
++	if (reject_admission)
++		return false;
++	return __real_bf_launch_txn_share_nodes(members, count);
++}
++
++static job_record_t *gpu_array(uint32_t array_id, uint32_t tasks, uint32_t limit)
++{
++	job_record_t *owner = new_array(array_id, tasks, limit);
++	job_details_t *details = owner->details;
++	gres_state_t *gres = xmalloc(sizeof(*gres));
++	gres_job_state_t *request = xmalloc(sizeof(*request));
++
++	details->num_tasks = 1;
++	details->min_nodes = details->max_nodes = 1;
++	details->min_cpus = details->orig_min_cpus = 12;
++	details->max_cpus = details->orig_max_cpus = NO_VAL;
++	details->cpus_per_task = details->orig_cpus_per_task = 12;
++	details->pn_min_memory = details->orig_pn_min_memory = 131072;
++	details->mc_ptr = xmalloc(sizeof(*details->mc_ptr));
++	details->mc_ptr->ntasks_per_socket = INFINITE16;
++	gres->gres_name = xstrdup("gpu");
++	gres->state_type = GRES_STATE_TYPE_JOB;
++	gres->gres_data = request;
++	request->gres_per_task = request->total_gres = 1;
++	owner->gres_list_req = list_create(NULL);
++	list_append(owner->gres_list_req, gres);
++	for (uint32_t victim = 0; victim < 8; victim++) {
++		batch_victims[victim] = new_job(array_id + 10000 + victim,
++					       JOB_RUNNING);
++		batch_victims[victim]->node_bitmap = bit_alloc(64);
++		bit_set(batch_victims[victim]->node_bitmap, 8);
++	}
++	return owner;
++}
++
++static job_launch_t *open_batch(job_record_t *owner)
++{
++	bitstr_t *nodes = bit_alloc(64);
++	list_t *victims = NULL;
++	resv_exc_t exclusions = { 0 };
++	job_launch_t *plan;
++
++	bit_set(nodes, 8);
++	_het_job_append_job_id(&victims, batch_victims[0]->job_id);
++	plan = _job_launch_begin_array_batch(owner, &test_partition, NULL,
++		NULL, false, nodes, victims, &exclusions, 3600);
++	FREE_NULL_BITMAP(nodes);
++	FREE_NULL_LIST(victims);
++	return plan;
++}
++
++static bool node_visible(job_record_t *job_ptr)
++{
++	bitstr_t *nodes = bit_copy(test_partition.node_bitmap);
++	bool visible;
++
++	bf_launch_txn_filter_nodes(job_ptr, nodes);
++	visible = bit_test(nodes, 8);
++	FREE_NULL_BITMAP(nodes);
++	return visible;
++}
++
++static void clear_batch(uint32_t *members, uint32_t count)
++{
++	for (uint32_t member = 0; member < count; member++) {
++		job_launch_t *plan = _job_launch_find(members[member]);
++
++		if (plan)
++			_job_launch_clear(plan, "test cleanup");
++	}
++	for (uint32_t victim = 0; victim < 8; victim++)
++		batch_victims[victim]->job_state = JOB_COMPLETE;
++}
++
++static void test_batch_lifecycle(void)
++{
++	job_record_t *owner = gpu_array(6000, 20, 8);
++	job_launch_t *plan = open_batch(owner);
++	uint32_t members[8];
++	uint32_t calls_before = preempt_calls;
++	job_record_t competitor = { .job_id = 99999, .job_state = JOB_PENDING };
++	char *reason = NULL;
++
++	REQUIRE(plan && plan->batch_size == 8);
++	memcpy(members, plan->batch_members, sizeof(members));
++	REQUIRE(find_job_record(6000)->bf_launch_array_slots == 8);
++	REQUIRE(!node_visible(find_job_record(6000)));
++	REQUIRE(!node_visible(&competitor));
++	competitor.array_job_id = 6000;
++	competitor.bf_launch_transaction = true;
++	REQUIRE(!node_visible(&competitor));
++	competitor.het_job_id = competitor.job_id;
++	REQUIRE(!node_visible(&competitor));
++	REQUIRE(preempt_calls == calls_before);
++	for (uint32_t member = 0; member < 8; member++) {
++		job_record_t *task = find_job_record(members[member]);
++		job_launch_t *task_plan = _job_launch_find(members[member]);
++
++		REQUIRE(node_visible(task));
++		REQUIRE(task->details->num_tasks == 1);
++		REQUIRE(task->details->pn_min_memory == 131072);
++		if (member)
++			REQUIRE(task->time_limit == 3600);
++		REQUIRE(_job_launch_preempt_planned_jobs(task, task_plan));
++	}
++	REQUIRE(preempt_calls == calls_before + 8);
++	for (uint32_t victim = 0; victim < 8; victim++)
++		REQUIRE(batch_victims[victim]->end_time == test_now + 300);
++	test_now += 299;
++	REQUIRE(_job_launch_preempt_planned_jobs(owner, plan));
++	REQUIRE(preempt_calls == calls_before + 8);
++	find_job_record(members[1])->job_state = JOB_CANCELLED;
++	_job_launch_clear(_job_launch_find(members[1]), "cancel one task");
++	REQUIRE(find_job_record(6000)->bf_launch_array_slots == 7);
++	REQUIRE(!node_visible(&competitor));
++	for (uint32_t victim = 0; victim < 8; victim++)
++		batch_victims[victim]->job_state = JOB_COMPLETING;
++	test_now += 2;
++	REQUIRE(_job_launch_preempt_planned_jobs(owner, plan));
++	for (uint32_t victim = 0; victim < 8; victim++)
++		batch_victims[victim]->job_state = JOB_COMPLETE;
++	for (uint32_t member = 0; member < 8; member++) {
++		job_record_t *task = find_job_record(members[member]);
++		job_launch_t *task_plan = _job_launch_find(members[member]);
++
++		if (!task_plan)
++			continue;
++		REQUIRE(_job_launch_validate(task_plan, &reason));
++		REQUIRE(!reason);
++		REQUIRE(!_job_launch_preempt_planned_jobs(task, task_plan));
++		task->node_bitmap = bit_copy(task_plan->planned_node_bitmap);
++		task->job_state = JOB_RUNNING;
++		job_array_start(task);
++		_job_launch_clear(task_plan, "job started");
++		if (member == 0) {
++			task->job_state = JOB_PENDING;
++			REQUIRE(!task->bf_launch_transaction);
++			REQUIRE(!node_visible(task));
++			task->job_state = JOB_RUNNING;
++		}
++		if (member < 7)
++			REQUIRE(!node_visible(&competitor));
++	}
++	REQUIRE(node_visible(&competitor));
++	REQUIRE(find_job_record(6000)->bf_launch_array_slots == 0);
++	REQUIRE(find_job_record(6000)->array_recs->tot_run_tasks == 7);
++	puts("PASS: batch admission, exact membership, parallel grace, partial cancellation, sibling starts, final fence release");
++}
++
++static void test_batch_bounds(void)
++{
++	job_record_t *owner = gpu_array(6100, 20, 7);
++	job_launch_t *plan;
++	uint32_t members[8];
++	uint32_t calls_before = preempt_calls;
++
++	owner->array_recs->tot_run_tasks = 5;
++	plan = open_batch(owner);
++	REQUIRE(plan && plan->batch_size == 2);
++	REQUIRE(list_count(plan->planned_preemptee_job_ids) == 2);
++	memcpy(members, plan->batch_members, 2 * sizeof(*members));
++	REQUIRE(_job_launch_preempt_planned_jobs(owner, plan));
++	REQUIRE(preempt_calls == calls_before + 2);
++	REQUIRE(!batch_victims[2]->preempt_time);
++	clear_batch(members, 2);
++	owner = gpu_array(6200, 20, 20);
++	bf_max_job_array_launch = 3;
++	plan = open_batch(owner);
++	REQUIRE(plan && plan->batch_size == 3);
++	memcpy(members, plan->batch_members, 3 * sizeof(*members));
++	REQUIRE(find_job_record(6200)->bf_launch_array_slots == 3);
++	clear_batch(members, 3);
++	bf_max_job_array_launch = 100;
++	owner = gpu_array(6300, 20, 20);
++	owner->details->pn_min_memory = MEM_PER_CPU | 4096;
++	owner->details->orig_pn_min_memory = MEM_PER_CPU | 4096;
++	probe_capacity = 3;
++	plan = open_batch(owner);
++	REQUIRE(plan && plan->batch_size == 3);
++	memcpy(members, plan->batch_members, 3 * sizeof(*members));
++	clear_batch(members, 3);
++	probe_capacity = 8;
++	puts("PASS: array %N, task-counted preparation cap, minimal victims, smaller feasible batch, per-CPU memory");
++}
++
++static void test_admission_failure_and_request_change(void)
++{
++	job_record_t *owner = gpu_array(6400, 20, 8);
++	job_launch_t *plan;
++	uint32_t members[8];
++	uint32_t calls_before = preempt_calls;
++	char *reason = NULL;
++	list_itr_t *iter;
++	job_record_t *task;
++
++	owner->time_limit = 1;
++	reject_admission = true;
++	REQUIRE(!open_batch(owner));
++	REQUIRE(preempt_calls == calls_before);
++	REQUIRE(find_job_record(6400)->bf_launch_array_slots == 0);
++	REQUIRE(node_visible(find_job_record(6400)));
++	iter = list_iterator_create(job_list);
++	while ((task = list_next(iter))) {
++		if ((task->array_job_id == 6400) && (task != owner))
++			REQUIRE(task->time_limit == 3600);
++	}
++	list_iterator_destroy(iter);
++	reject_admission = false;
++	clear_batch(NULL, 0);
++	owner = gpu_array(6500, 20, 8);
++	plan = open_batch(owner);
++	REQUIRE(plan && plan->batch_size == 8);
++	memcpy(members, plan->batch_members, sizeof(members));
++	owner->details->cpus_per_task = 24;
++	REQUIRE(!_job_launch_validate(plan, &reason));
++	REQUIRE(strstr(reason, "resource request changed"));
++	xfree(reason);
++	clear_batch(members, 8);
++	owner = gpu_array(6600, 20, 8);
++	bf_max_job_array_node_batch = 1;
++	plan = open_batch(owner);
++	REQUIRE(plan && !plan->batch_size);
++	REQUIRE(list_count(plan->planned_preemptee_job_ids) == 1);
++	_job_launch_clear(plan, "test cleanup");
++	puts("PASS: failed admission releases slots without signals, split time limits restored, changed requests rejected, opt-out");
++}
++
++static void test_last_tasks_and_membership(void)
++{
++	job_record_t *owner = gpu_array(6700, 2, 8);
++	job_launch_t *plan;
++	uint32_t members[2];
++	uint32_t invalid[2];
++	bitstr_t *nodes = bit_alloc(64);
++	job_record_t *foreign;
++
++	bf_max_job_array_node_batch = 8;
++	plan = open_batch(owner);
++	REQUIRE(plan && plan->batch_size == 2);
++	memcpy(members, plan->batch_members, sizeof(members));
++	REQUIRE(members[1] == 6700);
++	REQUIRE(find_job_record(6700)->bf_launch_array_slots == 2);
++	bit_set(nodes, 8);
++	bf_launch_txn_filter_reservation_nodes(nodes);
++	REQUIRE(bit_set_count(nodes) == 0);
++	FREE_NULL_BITMAP(nodes);
++	foreign = new_job(6800, JOB_PENDING);
++	foreign->array_job_id = 6800;
++	foreign->bf_launch_transaction = true;
++	invalid[0] = members[0];
++	invalid[1] = foreign->job_id;
++	REQUIRE(!__real_bf_launch_txn_share_nodes(invalid, 2));
++	invalid[1] = members[0];
++	REQUIRE(!__real_bf_launch_txn_share_nodes(invalid, 2));
++	REQUIRE(!node_visible(foreign));
++	clear_batch(members, 2);
++	REQUIRE(find_job_record(6700)->bf_launch_array_slots == 0);
++	REQUIRE(node_visible(foreign));
++	puts("PASS: last shared array record, reservation exclusion, foreign/duplicate membership rejected, slot release");
++}
++
++int main(void)
++{
++	previous_tests_main();
++	job_list = list_create(NULL);
++	job_launch_list = list_create(_job_launch_del);
++	next_job_id = 50000;
++	bf_max_job_array_launch = 100;
++	bf_max_job_array_node_batch = 8;
++	slurm_conf.select_type = xstrdup("select/cons_tres");
++	test_batch_lifecycle();
++	test_batch_bounds();
++	test_admission_failure_and_request_change();
++	test_last_tasks_and_membership();
++	return 0;
++}
+diff --git a/testsuite/slurm_unit/backfill/test_array_node_batches.sh b/testsuite/slurm_unit/backfill/test_array_node_batches.sh
+new file mode 100644
+index 0000000000..b5cb9fe8fd
+--- /dev/null
++++ b/testsuite/slurm_unit/backfill/test_array_node_batches.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++set -euo pipefail
++source_root=$(cd "$(dirname "$0")/../../.." && pwd)
++build_root=${SLURM_BUILD_ROOT:-$source_root}
++test_build=$(mktemp -d)
++trap 'rm -rf "$test_build"' EXIT
++compiler=${CC:-cc}
++flags=(-I"$build_root" -I"$source_root" -include "$build_root/config.h"
++    -O0 -g -DNDEBUG -ffunction-sections -fdata-sections
++    -Werror=implicit-function-declaration -Werror=incompatible-pointer-types
++    -Werror=unused-variable)
++"$compiler" "${flags[@]}" -c "$source_root/src/slurmctld/job_mgr.c" -o "$test_build/job_mgr.o"
++objcopy --weaken-symbol=find_job_record "$test_build/job_mgr.o"
++"$compiler" "${flags[@]}" -c "$source_root/src/slurmctld/node_scheduler.c" -o "$test_build/node_scheduler.o"
++"$compiler" "${flags[@]}" -c "$source_root/testsuite/slurm_unit/backfill/array_node_batch_test.c" -o "$test_build/test.o"
++wraps=()
++for symbol in time job_array_split schedule_job_save bitmap2node_name \
++    find_part_record job_overlap_and_running slurm_job_preempt_mode slurm_job_preempt \
++    select_g_job_test slurm_find_preemptable_jobs bf_launch_txn_share_nodes; do
++    wraps+=("-Wl,--wrap=$symbol")
++done
++"$compiler" -Wl,--gc-sections "${wraps[@]}" "$test_build/test.o" \
++    "$test_build/job_mgr.o" "$test_build/node_scheduler.o" \
++    -L"$build_root/src/api/.libs" -lslurmfull -lpthread -ldl -lm \
++    -Wl,-rpath,"$build_root/src/api/.libs" -o "$test_build/test"
++"$test_build/test"
