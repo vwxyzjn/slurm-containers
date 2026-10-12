@@ -1,0 +1,443 @@
+diff --git a/doc/html/heterogeneous_jobs.shtml b/doc/html/heterogeneous_jobs.shtml
+index 198614e..52f2c32 100644
+--- a/doc/html/heterogeneous_jobs.shtml
++++ b/doc/html/heterogeneous_jobs.shtml
+@@ -47,7 +47,10 @@ account name could be specified for each hetjob component.
+ For example, <i>--immediate</i> and <i>--job-name</i> are propagated, while
+ <i>--ntasks</i> and <i>--mem-per-cpu</i> are reset to default values for each
+ component.
+-A list of propagated options follows.</p>
++A list of propagated options follows.
++<i>--no-kill</i> is not propagated: it applies only to the component it is
++specified for, so one component can keep running without a failed node while
++the others are terminated.</p>
+ <ul>
+ <li>--account</li>
+ <li>--acctg-freq</li>
+@@ -79,7 +82,6 @@ A list of propagated options follows.</p>
+ <li>--no-allocate       (option available only in srun)</li>
+ <li>--no-requeue</li>
+ <li>--nice</li>
+-<li>--no-kill</li>
+ <li>--open-mode         (option available only in srun)</li>
+ <li>--output</li>
+ <li>--parsable</li>
+diff --git a/doc/man/man1/salloc.1 b/doc/man/man1/salloc.1
+index ccc9312..e41cfa7 100644
+--- a/doc/man/man1/salloc.1
++++ b/doc/man/man1/salloc.1
+@@ -1681,6 +1681,9 @@ within the job allocation explicitly requested \-\-no\-kill.
+ Specify an optional argument of "off" to disable the effect of the
+ \fBSALLOC_NO_KILL\fR environment variable.
+ 
++In a heterogeneous job, this option applies only to the component it is
++specified for; it is not propagated to the other components.
++
+ By default Slurm terminates the entire job allocation if any node fails in its
+ range of allocated nodes.
+ .IP
+diff --git a/doc/man/man1/sbatch.1 b/doc/man/man1/sbatch.1
+index ed04e19..ee317c6 100644
+--- a/doc/man/man1/sbatch.1
++++ b/doc/man/man1/sbatch.1
+@@ -1850,6 +1850,9 @@ within the job allocation explicitly requested \-\-no\-kill.
+ Specify an optional argument of "off" to disable the effect of the
+ \fBSBATCH_NO_KILL\fR environment variable.
+ 
++In a heterogeneous job, this option applies only to the component it is
++specified for; it is not propagated to the other components.
++
+ By default Slurm terminates the entire job allocation if any node fails in its
+ range of allocated nodes.
+ .IP
+diff --git a/doc/man/man1/srun.1 b/doc/man/man1/srun.1
+index 4b5fe0e..49e9fae 100644
+--- a/doc/man/man1/srun.1
++++ b/doc/man/man1/srun.1
+@@ -2247,6 +2247,9 @@ but subsequent job steps may be run if this option is specified.
+ Specify an optional argument of "off" disable the effect of the
+ \fBSLURM_NO_KILL\fR environment variable.
+ 
++In a heterogeneous job, this option applies only to the component it is
++specified for; it is not propagated to the other components.
++
+ The default action is to terminate the job upon node failure.
+ .IP
+ 
+diff --git a/doc/man/man5/slurm.conf.5 b/doc/man/man5/slurm.conf.5
+index 9fe5ac2..02cfea9 100644
+--- a/doc/man/man5/slurm.conf.5
++++ b/doc/man/man5/slurm.conf.5
+@@ -4470,6 +4470,21 @@ Enable job steps that span heterogeneous job allocations.
+ The default value.
+ .IP
+ 
++.TP
++\fBhet_component_node_fail\fR
++When a node fails, only the heterogeneous job component that holds the node is
++affected: it loses the node (\-\-no\-kill) or ends with NODE_FAIL. The other
++components are neither resized nor killed. A component other than the leader
++is not requeued alone, since the batch script runs on the leader. The exception
++is the leader itself: if it holds the failed node and cannot continue without
++it, or the node runs its batch script (even with \-\-no\-kill), the whole
++heterogeneous job takes the failure: every component is requeued if it can be,
++and otherwise ends with NODE_FAIL, with or without \-\-no\-kill.
++Components of jobs submitted with \fBsbatch \-\-het\-batch=each\fR always fail
++independently, and can be requeued alone.
++By default, a node failure affects every component of the heterogeneous job.
++.IP
++
+ .TP
+ \fBenable_job_state_cache\fR
+ Enables an independent cache of job state details within slurmctld. This allows
+diff --git a/src/common/slurm_opt.c b/src/common/slurm_opt.c
+index f27c02e..f956cfd 100644
+--- a/src/common/slurm_opt.c
++++ b/src/common/slurm_opt.c
+@@ -2497,6 +2497,13 @@ static char *arg_get_no_kill(slurm_opt_t *opt)
+ 	return xstrdup(opt->no_kill ? "set" : "unset");
+ }
+ COMMON_OPTION_RESET(no_kill, false);
++/*
++ * Reset for every hetjob component: each component's kill_on_node_fail comes
++ * from its own options only. Without this, sbatch's first pass (which reads
++ * the options of every component on the command line) gave --no-kill on any
++ * component to all of them, and later passes kept it for the components that
++ * follow, so a hetjob could not have --no-kill on one component only.
++ */
+ static slurm_cli_opt_t slurm_opt_no_kill = {
+ 	.name = "no-kill",
+ 	.has_arg = optional_argument,
+@@ -2504,6 +2511,7 @@ static slurm_cli_opt_t slurm_opt_no_kill = {
+ 	.set_func = arg_set_no_kill,
+ 	.get_func = arg_get_no_kill,
+ 	.reset_func = arg_reset_no_kill,
++	.reset_each_pass = true,
+ };
+ 
+ /* see --requeue below as well */
+diff --git a/src/slurmctld/job_mgr.c b/src/slurmctld/job_mgr.c
+index 1f84f32..f5dcf46 100644
+--- a/src/slurmctld/job_mgr.c
++++ b/src/slurmctld/job_mgr.c
+@@ -252,6 +252,10 @@ typedef struct {
+ 	time_t now;
+ 	part_record_t *part_ptr;
+ 	bool requeue_on_resume_failure;
++	bool het_comp_node_fail;	/* SchedulerParameters=
++					 * het_component_node_fail */
++	list_t *het_whole_fail;		/* het_job_ids (uint32_t *) whose
++					 * whole hetjob ends with this node */
+ } foreach_kill_job_by_t;
+ 
+ typedef struct {
+@@ -2876,13 +2880,147 @@ static int _find_het_job_on_node(void *x, void *arg)
+ 	return 0;
+ }
+ 
+-static bool _het_job_on_node(job_record_t *job_ptr, int node_inx)
++/*
++ * Return true if a running job keeps running when it loses one node: this is
++ * the first branch of _foreach_kill_running_job_by_node() (--no-kill and more
++ * than one node), where the node is excised from the allocation.
++ */
++static bool _job_survives_node_loss(job_record_t *job_ptr)
++{
++	return (job_ptr->details && (job_ptr->kill_on_node_fail == 0) &&
++		(job_ptr->node_cnt > 1) && !IS_JOB_CONFIGURING(job_ptr));
++}
++
++static int _find_het_job_id(void *x, void *key)
++{
++	return (*(uint32_t *) x == *(uint32_t *) key);
++}
++
++/* The record's hetjob was found by _foreach_find_het_whole_fail() */
++static bool _het_job_whole_fail(job_record_t *job_ptr,
++				foreach_kill_job_by_t *foreach_kill_job_by)
++{
++	return (job_ptr->het_job_id && foreach_kill_job_by->het_whole_fail &&
++		list_find_first(foreach_kill_job_by->het_whole_fail,
++				_find_het_job_id, &job_ptr->het_job_id));
++}
++
++/*
++ * Return true if a hetjob leader that runs the hetjob's only batch script is
++ * lost with this node: it holds the node and either cannot keep running
++ * without it (no --no-kill, or a single node) or the node is its batch host.
++ * With --no-kill the leader would otherwise keep running without its batch
++ * script, and nothing would ever end or requeue the hetjob.
++ */
++static bool _het_leader_lost(job_record_t *job_ptr, node_record_t *node_ptr)
++{
++	if (!_job_node_test(job_ptr, node_ptr->index))
++		return false;
++	if (!_job_survives_node_loss(job_ptr))
++		return true;
++	return (job_ptr->batch_flag && job_ptr->batch_host &&
++		!xstrcmp(job_ptr->batch_host, node_ptr->name));
++}
++
++/*
++ * With het_component_node_fail, a node failure normally only reaches the
++ * hetjob component that holds the node. The exception is a hetjob that runs
++ * a single batch script on the leader (stock batch semantics): when the
++ * leader is lost with the node (_het_leader_lost()), the batch script is
++ * gone, so the whole hetjob takes the node failure: every component counts
++ * as on the node, and none of them keeps running without it, --no-kill or
++ * not. Each record is requeued if it is a requeueable batch job, and
++ * otherwise ends with NODE_FAIL, as a component without --no-kill does in
++ * stock Slurm. Those hetjobs are collected here, before any job record is
++ * changed, so the decision does not depend on job_list order (see
++ * _het_job_on_node()).
++ */
++static int _foreach_find_het_whole_fail(void *x, void *arg)
++{
++	job_record_t *job_ptr = x;
++	foreach_kill_job_by_t *foreach_kill_job_by = arg;
++	uint32_t *het_job_id;
++
++	if (!job_ptr->het_job_list || (job_ptr->het_job_id != job_ptr->job_id))
++		return 0;	/* not a hetjob leader */
++	if (!IS_JOB_RUNNING(job_ptr) && !IS_JOB_SUSPENDED(job_ptr))
++		return 0;
++	if (!_het_leader_lost(job_ptr, foreach_kill_job_by->node_ptr))
++		return 0;
++
++	het_job_id = xmalloc(sizeof(*het_job_id));
++	*het_job_id = job_ptr->het_job_id;
++	if (!foreach_kill_job_by->het_whole_fail)
++		foreach_kill_job_by->het_whole_fail = list_create(xfree_ptr);
++	list_append(foreach_kill_job_by->het_whole_fail, het_job_id);
++	return 0;
++}
++
++/*
++ * Return true if a node failure is handled for this hetjob component alone:
++ * only the record that holds the node is affected. Return false for records
++ * that follow the stock rules, where every component of a hetjob counts as
++ * being on the node (see _find_het_job_on_node()).
++ */
++static bool _het_comp_fails_alone(job_record_t *job_ptr,
++				  foreach_kill_job_by_t *foreach_kill_job_by)
++{
++	if (!job_ptr->het_job_id)
++		return false;
++	if (!foreach_kill_job_by->het_comp_node_fail)
++		return false;
++	/* The leader running the only batch script is lost with the node */
++	if (foreach_kill_job_by->het_whole_fail &&
++	    list_find_first(foreach_kill_job_by->het_whole_fail,
++			    _find_het_job_id, &job_ptr->het_job_id))
++		return false;
++	return true;
++}
++
++/*
++ * A hetjob component that fails alone may only be requeued alone if it runs
++ * its own batch script. With the stock batch semantics only the leader does:
++ * relaunching a lone non-leader component would start the leader's script a
++ * second time (launch_job() -> _het_job_ready()), so such a component ends
++ * with NODE_FAIL instead.
++ */
++static bool _het_comp_can_requeue(job_record_t *job_ptr, bool fails_alone)
++{
++	return !fails_alone;
++}
++
++static bool _het_job_on_node(job_record_t *job_ptr, int node_inx,
++			     foreach_kill_job_by_t *foreach_kill_job_by)
+ {
+ 	job_record_t *het_job_leader;
+ 
+ 	if (!job_ptr->het_job_id)
+ 		return _job_node_test(job_ptr, node_inx);
+ 
++	/*
++	 * Per-component node failure: only the record that holds the node is
++	 * affected, unless the leader running the hetjob's only batch script
++	 * is lost with it (see _foreach_find_het_whole_fail()).
++	 */
++	if (_het_comp_fails_alone(job_ptr, foreach_kill_job_by))
++		return _job_node_test(job_ptr, node_inx);
++
++	/*
++	 * The leader running the only batch script is lost with the node, as
++	 * decided before any record changed: every component counts as on
++	 * the node. _find_het_job_on_node() below would look at records this
++	 * pass already changed: a requeued leader no longer holds the node and
++	 * is not NODE_FAIL, so the components after it in job_list would be
++	 * missed, left running and then ended by the leader's batch script
++	 * completion (job_complete() fans out) instead of being requeued with
++	 * it. None of them keeps running without the node, --no-kill or not
++	 * (see _foreach_kill_running_job_by_node()): a component left running
++	 * would be ended by that batch script completion, or the requeued
++	 * leader would later start alone into it.
++	 */
++	if (_het_job_whole_fail(job_ptr, foreach_kill_job_by))
++		return true;
++
+ 	het_job_leader = find_job_record(job_ptr->het_job_id);
+ 	if (!het_job_leader) {
+ 		error("%s: Hetjob leader %pJ not found",
+@@ -2906,11 +3044,15 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 	node_record_t *node_ptr = foreach_kill_job_by->node_ptr;
+ 	bool suspended = false;
+ 	job_resources_t *job_resrcs_ptr = job_ptr->job_resrcs;
++	bool het_alone, het_whole;
+ 
+ 	xassert(node_ptr);
+ 
+-	if (!_het_job_on_node(job_ptr, node_ptr->index))
++	if (!_het_job_on_node(job_ptr, node_ptr->index, foreach_kill_job_by))
+ 		return 0; /* job not on this node */
++	het_alone = _het_comp_fails_alone(job_ptr, foreach_kill_job_by);
++	/* The whole hetjob takes the failure: no component keeps running */
++	het_whole = _het_job_whole_fail(job_ptr, foreach_kill_job_by);
+ 	if (IS_JOB_SUSPENDED(job_ptr)) {
+ 		uint32_t suspend_job_state = job_ptr->job_state;
+ 		/*
+@@ -2944,10 +3086,7 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 		}
+ 	} else if (IS_JOB_RUNNING(job_ptr) || suspended) {
+ 		foreach_kill_job_by->kill_job_cnt++;
+-		if ((job_ptr->details) &&
+-		    (job_ptr->kill_on_node_fail == 0) &&
+-		    (job_ptr->node_cnt > 1) &&
+-		    !IS_JOB_CONFIGURING(job_ptr)) {
++		if (!het_whole && _job_survives_node_loss(job_ptr)) {
+ 			bitstr_t *orig_job_node_bitmap;
+ 
+ 			/* keep job running on remaining nodes */
+@@ -2971,6 +3110,7 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 				&job_ptr->gres_used);
+ 			job_post_resize_acctg(job_ptr);
+ 		} else if (job_ptr->batch_flag &&
++			   _het_comp_can_requeue(job_ptr, het_alone) &&
+ 			   ((job_ptr->details &&
+ 			     job_ptr->details->requeue) ||
+ 			    (foreach_kill_job_by->requeue_on_resume_failure &&
+@@ -3049,15 +3189,21 @@ extern int kill_running_job_by_node_ptr(node_record_t *node_ptr)
+ {
+ 	static time_t sched_update = 0;
+ 	static bool requeue_on_resume_failure = false;
++	static bool het_comp_node_fail = false;
+ 	foreach_kill_job_by_t foreach_kill_job_by = {
+ 		.node_ptr = node_ptr,
+ 		.now = time(NULL),
+ 	};
++	list_itr_t *job_iterator;
++	job_record_t *job_ptr;
+ 
+ 	if (sched_update != slurm_conf.last_update) {
+ 		requeue_on_resume_failure =
+ 			xstrcasestr(slurm_conf.sched_params,
+ 				    "requeue_on_resume_failure");
++		het_comp_node_fail =
++			xstrcasestr(slurm_conf.sched_params,
++				    "het_component_node_fail");
+ 		sched_update = slurm_conf.last_update;
+ 	}
+ 
+@@ -3069,9 +3215,29 @@ extern int kill_running_job_by_node_ptr(node_record_t *node_ptr)
+ 
+ 	foreach_kill_job_by.requeue_on_resume_failure =
+ 		requeue_on_resume_failure;
++	foreach_kill_job_by.het_comp_node_fail = het_comp_node_fail;
++	if (het_comp_node_fail)
++		list_for_each(job_list, _foreach_find_het_whole_fail,
++			      &foreach_kill_job_by);
+ 
+-	list_for_each(job_list, _foreach_kill_running_job_by_node,
+-		      &foreach_kill_job_by);
++	/*
++	 * Walk job_list with an iterator, not list_for_each(): that holds
++	 * job_list's lock while the callback runs, and the callback resizes a
++	 * --no-kill job that survives the node (job_post_resize_acctg()). For
++	 * a job in a Flags=REPLACE reservation that still holds busy nodes,
++	 * the resize looks for replacement nodes (resv_replace_update() ->
++	 * _resv_node_replace() -> _select_nodes() -> ... _pick_node_cnt()),
++	 * which walks job_list with list_iterator_create(): a write lock this
++	 * thread already holds, EDEADLK, fatal() (25.05.3). An iterator takes
++	 * the lock only inside each list_next(), as this walk did before it
++	 * became list_for_each().
++	 */
++	job_iterator = list_iterator_create(job_list);
++	while ((job_ptr = list_next(job_iterator)))
++		(void) _foreach_kill_running_job_by_node(job_ptr,
++							 &foreach_kill_job_by);
++	list_iterator_destroy(job_iterator);
++	FREE_NULL_LIST(foreach_kill_job_by.het_whole_fail);
+ 
+ 	if (foreach_kill_job_by.kill_job_cnt)
+ 		last_job_update = foreach_kill_job_by.now;
+@@ -10045,6 +10211,19 @@ static int _list_find_job_old(void *job_entry, void *key)
+ 		return 0;      /* Stage out in progress */
+ 
+ end_it:
++	/*
++	 * Hetjob records are purged together, once every component is old
++	 * enough (HETJOB_PURGE, set by _purge_complete_het_job()). Purging one
++	 * record alone would leave a dangling pointer in the leader's
++	 * het_job_list, or free the leader's het_job_list and het_details while
++	 * other components still use them. This matters once components end
++	 * on their own (het_component_node_fail, scancel <id>+N). key is NULL
++	 * when _purge_complete_het_job() asks whether a component is old
++	 * enough.
++	 */
++	if (key && job_ptr->het_job_id &&
++	    find_job_record(job_ptr->het_job_id))
++		return 0;
+ 
+ 	return 1;		/* Purge the job */
+ }
+diff --git a/src/slurmctld/read_config.c b/src/slurmctld/read_config.c
+index 2fb48cf..12b23df 100644
+--- a/src/slurmctld/read_config.c
++++ b/src/slurmctld/read_config.c
+@@ -996,6 +996,7 @@ static void _sync_part_prio(void)
+ static int _foreach_requeue_job_node_failed(void *x, void *arg)
+ {
+ 	job_record_t *job_ptr = x;
++	bool het_comp_node_fail = *(bool *) arg;
+ 	job_record_t *het_job_leader;
+ 	int rc = SLURM_SUCCESS;
+ 
+@@ -1005,6 +1006,21 @@ static int _foreach_requeue_job_node_failed(void *x, void *arg)
+ 		return SLURM_SUCCESS;
+ 
+ 	het_job_leader = find_job_record(job_ptr->het_job_id);
++
++	/*
++	 * A hetjob component that failed alone was handled when its node
++	 * failed, and its record is kept until the whole hetjob is purged, so
++	 * it may be found here long after. Requeueing its leader would requeue
++	 * every component. With SchedulerParameters=het_component_node_fail
++	 * that is a component other than the leader that ended with NODE_FAIL
++	 * while its leader did not. Records that _sync_jobs_to_conf() marked
++	 * JOB_REQUEUE during this startup keep the stock handling.
++	 */
++	if (!IS_JOB_REQUEUED(job_ptr) && het_job_leader &&
++	    (het_job_leader != job_ptr) && het_comp_node_fail &&
++	    !IS_JOB_NODE_FAILED(het_job_leader))
++		return SLURM_SUCCESS;
++
+ 	if (het_job_leader && het_job_leader->batch_flag &&
+ 	    het_job_leader->details &&
+ 	    het_job_leader->details->requeue &&
+@@ -1030,10 +1046,14 @@ static int _foreach_requeue_job_node_failed(void *x, void *arg)
+ 
+ static void _requeue_job_node_failed(void)
+ {
++	bool het_comp_node_fail = xstrcasestr(slurm_conf.sched_params,
++					      "het_component_node_fail");
++
+ 	xassert(job_list);
+ 
+ 	(void) list_for_each_nobreak(job_list,
+-				     _foreach_requeue_job_node_failed, NULL);
++				     _foreach_requeue_job_node_failed,
++				     &het_comp_node_fail);
+ }
+ 
+ static void _abort_job(job_record_t *job_ptr, uint32_t job_state,

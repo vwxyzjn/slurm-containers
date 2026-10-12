@@ -1,0 +1,793 @@
+diff --git a/doc/man/man1/sbatch.1 b/doc/man/man1/sbatch.1
+index 6714d01..ff22b57 100644
+--- a/doc/man/man1/sbatch.1
++++ b/doc/man/man1/sbatch.1
+@@ -1351,6 +1351,32 @@ Must be enabled with \fBSchedulerParameters=het_batch_each\fR. Set it on the
+ command line or in the first component's options; it applies to all components.
+ .IP
+ 
++.TP
++\fB\-\-het\-join\fR=<\fIjob_id\fR>
++Submit an ordinary batch job that becomes a new component of the running
++heterogeneous job \fIjob_id\fR when it starts. That heterogeneous job must
++belong to the same user, have been submitted with \fB\-\-het\-batch\fR=\fIeach\fR
++and \fB\-\-het\-reserve\fR, and have a running component. The new job gets the
++lowest free job ID reserved by it, \fIjob_id+N\fR, waits in the queue and is
++scheduled alone like any other job (it never waits for the other components),
++and when it starts it is attached as component \fIjob_id+N\fR: \fBsqueue\fR
++shows it as \fIjob_id+N\fR and "\fIscancel job_id\fR" cancels it with the other
++components (also while it is pending). It runs its own batch script with
++\fBSLURM_HET_JOB_ID\fR and \fBSLURM_HET_JOB_OFFSET\fR set. If every component
++of the heterogeneous job ends before it starts, it is cancelled, also while it
++is held. Not allowed with \fB\-\-jobid\fR.
++.IP
++
++.TP
++\fB\-\-het\-reserve\fR=<\fIcount\fR>
++Heterogeneous jobs with \fB\-\-het\-batch\fR=\fIeach\fR only. Reserve job IDs
++\fIjob_id+0\fR to \fIjob_id+count\-1\fR for this heterogeneous job: its
++components take the first ones and jobs submitted later with
++\fB\-\-het\-join\fR take the others. No other job gets these IDs while the
++heterogeneous job's record exists, also across slurmctld restarts.
++\fIcount\fR must be at least the number of components and at most 1024.
++.IP
++
+ .TP
+ \fB\-H, \-\-hold\fR
+ Specify the job is to be submitted in a held state (priority of zero).
+diff --git a/slurm/slurm.h b/slurm/slurm.h
+index 173408a..4fb1979 100644
+--- a/slurm/slurm.h
++++ b/slurm/slurm.h
+@@ -1203,6 +1203,9 @@ enum node_states {
+ 					* own batch script, set by
+ 					* sbatch --het-batch=each */
+ 
++/* Upper bound of sbatch --het-reserve */
++#define HET_JOB_RESERVE_MAX 1024
++
+ /* These bits are set in the x11 field of job_desc_msg_t */
+ #define X11_FORWARD_ALL		0x0001	/* all nodes should setup forward */
+ #define X11_FORWARD_BATCH	0x0002  /* only the batch node */
+@@ -1646,6 +1649,11 @@ typedef struct job_descriptor {	/* For submit, allocate, and update requests */
+ 	uint64_t fed_siblings_viable; /* Bitmap of viable fed sibling ids */
+ 	uint32_t group_id;	/* group to assume, if run as root. */
+ 	uint32_t het_job_offset; /* HetJob component offset */
++	uint32_t het_join_id;	/* sbatch --het-join: start as a new component
++				 * of this running hetjob, 0 if none */
++	uint32_t het_reserve;	/* sbatch --het-reserve: job IDs reserved for
++				 * the hetjob (leader ID + 0..het_reserve-1),
++				 * 0 if none */
+ 	void *id;		/* actually identity_t. DO NOT PACK */
+ 	uint16_t immediate;	/* 1 if allocate to run or fail immediately,
+ 				 * 0 if to be queued awaiting resources */
+@@ -1849,6 +1857,8 @@ typedef struct job_info {
+ 	uint32_t het_join_offset; /* component offset it joins as */
+ 	uint32_t het_batch_restart; /* --het-batch=each: batch script relaunches
+ 				     * after a lost batch host */
++	uint32_t het_reserve;	/* hetjob leader: job IDs reserved with
++				 * --het-reserve, 0 if none */
+ 	uint32_t job_id;	/* job ID */
+ 	job_resources_t *job_resrcs; /* opaque data type, job resources */
+ 	char *job_size_str;
+diff --git a/src/common/job_record.c b/src/common/job_record.c
+index d07cd57..9b37dde 100644
+--- a/src/common/job_record.c
++++ b/src/common/job_record.c
+@@ -2608,6 +2608,8 @@ extern int job_record_pack(job_record_t *dump_job_ptr,
+ 			pack32(dump_job_ptr->het_join_offset, buffer);
+ 			pack32(dump_job_ptr->het_batch_restart, buffer);
+ 		}
++		if (protocol_version >= SLURM_25_05_HETFT2_PROTOCOL_VERSION)
++			pack32(dump_job_ptr->het_reserve, buffer);
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_record_pack_common(dump_job_ptr, true, buffer,
+ 				       protocol_version);
+@@ -3101,6 +3103,8 @@ extern int job_record_unpack(job_record_t **out,
+ 			safe_unpack32(&job_ptr->het_join_offset, buffer);
+ 			safe_unpack32(&job_ptr->het_batch_restart, buffer);
+ 		}
++		if (protocol_version >= SLURM_25_05_HETFT2_PROTOCOL_VERSION)
++			safe_unpack32(&job_ptr->het_reserve, buffer);
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_record_unpack_common(job_ptr, buffer, protocol_version);
+ 
+diff --git a/src/common/job_record.h b/src/common/job_record.h
+index 2cfca3b..f830335 100644
+--- a/src/common/job_record.h
++++ b/src/common/job_record.h
+@@ -336,6 +336,9 @@ struct job_record {
+ 	uint32_t het_batch_restart;	/* HETJOB_BATCH_EACH: times the batch
+ 					 * script was relaunched on a new
+ 					 * batch host after losing its own */
++	uint32_t het_reserve;		/* hetjob leader: job IDs het_job_id +
++					 * 0..het_reserve-1 are reserved for
++					 * its components (--het-reserve) */
+ 	uint32_t job_id;		/* job ID */
+ 	identity_t *id;			/* job identity */
+ 	job_record_t *job_next;		/* next entry with same hash index */
+diff --git a/src/common/slurm_opt.c b/src/common/slurm_opt.c
+index e80c221..13d566a 100644
+--- a/src/common/slurm_opt.c
++++ b/src/common/slurm_opt.c
+@@ -2161,6 +2161,85 @@ static slurm_cli_opt_t slurm_opt_het_batch = {
+ 	.reset_func = arg_reset_het_batch,
+ };
+ 
++/*
++ * --het-join=<jobid> (sbatch): start as a new component of running hetjob
++ * <jobid>, submitted with --het-batch=each and --het-reserve. The job gets the
++ * lowest free reserved job ID <jobid>+N, is scheduled alone and becomes
++ * component <jobid>+N when it starts.
++ */
++static int arg_set_het_join(slurm_opt_t *opt, const char *arg)
++{
++	if (!opt->sbatch_opt)
++		return SLURM_ERROR;
++
++	opt->sbatch_opt->het_join_id = parse_int("--het-join", arg, true);
++
++	return SLURM_SUCCESS;
++}
++static char *arg_get_het_join(slurm_opt_t *opt)
++{
++	if (!opt->sbatch_opt)
++		return xstrdup("invalid-context");
++
++	return xstrdup_printf("%u", opt->sbatch_opt->het_join_id);
++}
++static void arg_reset_het_join(slurm_opt_t *opt)
++{
++	if (opt->sbatch_opt)
++		opt->sbatch_opt->het_join_id = 0;
++}
++static slurm_cli_opt_t slurm_opt_het_join = {
++	.name = "het-join",
++	.has_arg = required_argument,
++	.val = LONG_OPT_HET_JOIN,
++	.set_func_sbatch = arg_set_het_join,
++	.get_func = arg_get_het_join,
++	.reset_func = arg_reset_het_join,
++};
++
++/*
++ * --het-reserve=<count> (sbatch, heterogeneous jobs with --het-batch=each):
++ * reserve job IDs <jobid>+0 .. <jobid>+count-1 for the hetjob, for its
++ * components and for jobs joining it later with --het-join.
++ */
++static int arg_set_het_reserve(slurm_opt_t *opt, const char *arg)
++{
++	int tmp;
++
++	if (!opt->sbatch_opt)
++		return SLURM_ERROR;
++
++	tmp = parse_int("--het-reserve", arg, true);
++	if (tmp > HET_JOB_RESERVE_MAX) {
++		error("Invalid --het-reserve specification, at most %d",
++		      HET_JOB_RESERVE_MAX);
++		return SLURM_ERROR;
++	}
++	opt->sbatch_opt->het_reserve = tmp;
++
++	return SLURM_SUCCESS;
++}
++static char *arg_get_het_reserve(slurm_opt_t *opt)
++{
++	if (!opt->sbatch_opt)
++		return xstrdup("invalid-context");
++
++	return xstrdup_printf("%u", opt->sbatch_opt->het_reserve);
++}
++static void arg_reset_het_reserve(slurm_opt_t *opt)
++{
++	if (opt->sbatch_opt)
++		opt->sbatch_opt->het_reserve = 0;
++}
++static slurm_cli_opt_t slurm_opt_het_reserve = {
++	.name = "het-reserve",
++	.has_arg = required_argument,
++	.val = LONG_OPT_HET_RESERVE,
++	.set_func_sbatch = arg_set_het_reserve,
++	.get_func = arg_get_het_reserve,
++	.reset_func = arg_reset_het_reserve,
++};
++
+ COMMON_SRUN_BOOL_OPTION(labelio);
+ static slurm_cli_opt_t slurm_opt_label = {
+ 	.name = "label",
+@@ -4242,6 +4321,8 @@ static const slurm_cli_opt_t *common_options[] = {
+ 	&slurm_opt_help,
+ 	&slurm_opt_het_batch,
+ 	&slurm_opt_het_group,
++	&slurm_opt_het_join,
++	&slurm_opt_het_reserve,
+ 	&slurm_opt_hint,
+ 	&slurm_opt_hold,
+ 	&slurm_opt_ignore_pbs,
+diff --git a/src/common/slurm_opt.h b/src/common/slurm_opt.h
+index 29dcbaa..0f824b2 100644
+--- a/src/common/slurm_opt.h
++++ b/src/common/slurm_opt.h
+@@ -200,6 +200,8 @@ enum {
+ 	LONG_OPT_WRAP,
+ 	LONG_OPT_X11,
+ 	LONG_OPT_HET_BATCH,
++	LONG_OPT_HET_JOIN,
++	LONG_OPT_HET_RESERVE,
+ 	LONG_OPT_ENUM_END
+ };
+ 
+@@ -220,6 +222,8 @@ typedef struct {
+ 	char *array_inx;		/* --array			*/
+ 	char *batch_features;		/* --batch			*/
+ 	char *export_file;		/* --export-file=file		*/
++	uint32_t het_join_id;		/* --het-join=jobid		*/
++	uint32_t het_reserve;		/* --het-reserve=count		*/
+ 	bool ignore_pbs;		/* --ignore-pbs			*/
+ 	int minsockets;			/* --minsockets=n		*/
+ 	int mincores;			/* --mincores=n			*/
+diff --git a/src/common/slurm_protocol_common.h b/src/common/slurm_protocol_common.h
+index 5edd5d5..2ad0dfb 100644
+--- a/src/common/slurm_protocol_common.h
++++ b/src/common/slurm_protocol_common.h
+@@ -68,11 +68,16 @@
+  *           het_batch_restart
+  */
+ #define SLURM_25_05_HETFT1_PROTOCOL_VERSION ((43 << 8) | 1)
++/*
++ *   HETFT2: job_desc_msg_t het_join_id, het_reserve; job_record_t/job_info
++ *           het_reserve (sbatch --het-join, --het-reserve)
++ */
++#define SLURM_25_05_HETFT2_PROTOCOL_VERSION ((43 << 8) | 2)
+ #define SLURM_24_11_PROTOCOL_VERSION ((42 << 8) | 0)
+ #define SLURM_24_05_PROTOCOL_VERSION ((41 << 8) | 0)
+ #define SLURM_23_11_PROTOCOL_VERSION ((40 << 8) | 0)
+ 
+-#define SLURM_PROTOCOL_VERSION SLURM_25_05_HETFT1_PROTOCOL_VERSION
++#define SLURM_PROTOCOL_VERSION SLURM_25_05_HETFT2_PROTOCOL_VERSION
+ #define SLURM_ONE_BACK_PROTOCOL_VERSION SLURM_24_11_PROTOCOL_VERSION
+ #define SLURM_TWO_BACK_PROTOCOL_VERSION SLURM_24_05_PROTOCOL_VERSION
+ #define SLURM_MIN_PROTOCOL_VERSION SLURM_23_11_PROTOCOL_VERSION
+diff --git a/src/common/slurm_protocol_pack.c b/src/common/slurm_protocol_pack.c
+index e587c5b..f9d9f00 100644
+--- a/src/common/slurm_protocol_pack.c
++++ b/src/common/slurm_protocol_pack.c
+@@ -213,6 +213,7 @@ int unpack_header(header_t *header, buf_t *buffer)
+ 	 * version this build speaks.
+ 	 */
+ 	if ((header->version != SLURM_PROTOCOL_VERSION) &&
++	    (header->version != SLURM_25_05_HETFT1_PROTOCOL_VERSION) &&
+ 	    (header->version != SLURM_25_05_PROTOCOL_VERSION) &&
+ 	    (header->version != SLURM_ONE_BACK_PROTOCOL_VERSION) &&
+ 	    (header->version != SLURM_TWO_BACK_PROTOCOL_VERSION) &&
+@@ -3602,6 +3603,8 @@ _unpack_job_info_members(job_info_t * job, buf_t *buffer,
+ 			safe_unpack32(&job->het_join_offset, buffer);
+ 			safe_unpack32(&job->het_batch_restart, buffer);
+ 		}
++		if (protocol_version >= SLURM_25_05_HETFT2_PROTOCOL_VERSION)
++			safe_unpack32(&job->het_reserve, buffer);
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		/* job_record_pack_common */
+ 		safe_unpackstr(&job->account, buffer);
+@@ -6855,6 +6858,11 @@ static void _pack_job_desc_msg(job_desc_msg_t *job_desc_ptr, buf_t *buffer,
+ 		pack_cron_entry(job_desc_ptr->crontab_entry, protocol_version,
+ 				buffer);
+ 		pack16(job_desc_ptr->segment_size, buffer);
++
++		if (protocol_version >= SLURM_25_05_HETFT2_PROTOCOL_VERSION) {
++			pack32(job_desc_ptr->het_join_id, buffer);
++			pack32(job_desc_ptr->het_reserve, buffer);
++		}
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		pack32(job_desc_ptr->site_factor, buffer);
+ 		packstr(job_desc_ptr->batch_features, buffer);
+@@ -7465,6 +7473,11 @@ _unpack_job_desc_msg(job_desc_msg_t ** job_desc_buffer_ptr, buf_t *buffer,
+ 				      protocol_version, buffer))
+ 			goto unpack_error;
+ 		safe_unpack16(&job_desc_ptr->segment_size, buffer);
++
++		if (protocol_version >= SLURM_25_05_HETFT2_PROTOCOL_VERSION) {
++			safe_unpack32(&job_desc_ptr->het_join_id, buffer);
++			safe_unpack32(&job_desc_ptr->het_reserve, buffer);
++		}
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_desc_ptr = xmalloc(sizeof(job_desc_msg_t));
+ 		*job_desc_buffer_ptr = job_desc_ptr;
+diff --git a/src/sbatch/opt.c b/src/sbatch/opt.c
+index 6895ba9..859a980 100644
+--- a/src/sbatch/opt.c
++++ b/src/sbatch/opt.c
+@@ -1134,6 +1134,10 @@ static void _help(void)
+ "      --gres-flags=opts       flags related to GRES management\n"
+ "      --het-batch=leader|each run the batch script on the leader only, or\n"
+ "                              on every component of a heterogeneous job\n"
++"      --het-join=jobid        start as a new component of running\n"
++"                              heterogeneous job jobid\n"
++"      --het-reserve=count     reserve job IDs jobid+0..jobid+count-1 for\n"
++"                              this heterogeneous job, for --het-join\n"
+ "  -H, --hold                  submit job in held state\n"
+ "      --ignore-pbs            Ignore #PBS and #BSUB options in the batch script\n"
+ "  -i, --input=in              file for batch script's standard input\n"
+diff --git a/src/sbatch/sbatch.c b/src/sbatch/sbatch.c
+index 740040b..d8e7676 100644
+--- a/src/sbatch/sbatch.c
++++ b/src/sbatch/sbatch.c
+@@ -231,6 +231,14 @@ int main(int argc, char **argv)
+ 		error("Internal parsing error");
+ 		exit(1);
+ 	}
++	if (job_req_list && sbopt.het_join_id) {
++		error("--het-join can not be used by a heterogeneous job");
++		exit(error_exit);
++	}
++	if (!job_req_list && sbopt.het_reserve) {
++		error("--het-reserve needs a heterogeneous job");
++		exit(error_exit);
++	}
+ 
+ 	if (job_env_list) {
+ 		list_itr_t *desc_iter, *env_iter;
+@@ -434,6 +442,9 @@ static int _fill_job_desc_from_opts(job_desc_msg_t *desc)
+ 	if (sbopt.requeue != NO_VAL)
+ 		desc->requeue = sbopt.requeue;
+ 
++	desc->het_join_id = sbopt.het_join_id;
++	desc->het_reserve = sbopt.het_reserve;
++
+ 	desc->environment = NULL;
+ 
+ 	if (opt.job_flags & EXTERNAL_JOB)
+diff --git a/src/scontrol/info_job.c b/src/scontrol/info_job.c
+index 168fda7..f32b667 100644
+--- a/src/scontrol/info_job.c
++++ b/src/scontrol/info_job.c
+@@ -194,13 +194,19 @@ static char *_sprint_job_info(job_info_t *job_ptr)
+ 	}
+ 
+ 	/****** Line (optional) ******/
+-	if ((job_ptr->bitflags & HETJOB_BATCH_EACH) || job_ptr->het_join_id) {
++	if ((job_ptr->bitflags & HETJOB_BATCH_EACH) || job_ptr->het_join_id ||
++	    job_ptr->het_reserve) {
+ 		char *sep = "";
+ 
+ 		if (job_ptr->bitflags & HETJOB_BATCH_EACH) {
+ 			xstrcat(out, "HetBatch=each");
+ 			sep = " ";
+ 		}
++		if (job_ptr->het_reserve) {
++			xstrfmtcat(out, "%sHetReserve=%u", sep,
++				   job_ptr->het_reserve);
++			sep = " ";
++		}
+ 		/* batch script relaunched after its batch host was lost */
+ 		if (job_ptr->het_batch_restart) {
+ 			xstrfmtcat(out, "%sHetBatchRestart=%u", sep,
+diff --git a/src/slurmctld/job_mgr.c b/src/slurmctld/job_mgr.c
+index 01c0484..07a0d0e 100644
+--- a/src/slurmctld/job_mgr.c
++++ b/src/slurmctld/job_mgr.c
+@@ -355,6 +355,8 @@ static uint32_t lowest_prio  = TOP_PRIORITY;
+ static int      hash_table_size = 0;
+ static int      job_count = 0;		/* job's in the system */
+ static uint32_t job_id_sequence = 0;	/* first job_id to assign new job */
++static list_t *het_reserve_leaders = NULL; /* uint32_t * IDs of hetjob
++					    * leaders with --het-reserve */
+ static struct   job_record **job_hash = NULL;
+ static struct   job_record **job_array_hash_j = NULL;
+ static struct   job_record **job_array_hash_t = NULL;
+@@ -419,6 +421,9 @@ static job_array_resp_msg_t *_resp_array_xlate(resp_array_struct_t *resp,
+ static int  _resume_job_nodes(job_record_t *job_ptr, bool indf_susp);
+ static void _send_job_kill(job_record_t *job_ptr);
+ static int  _set_job_id(job_record_t *job_ptr);
++static int  _set_job_id_block(job_record_t *job_ptr, uint32_t cnt);
++static bool _dup_job_file_test(uint32_t job_id);
++static void _het_reserve_add(uint32_t leader_id);
+ static void _set_job_requeue_exit_value(job_record_t *job_ptr);
+ static void _signal_batch_job(job_record_t *job_ptr, uint16_t signal,
+ 			      uint16_t flags);
+@@ -1355,6 +1360,8 @@ extern int load_all_job_state(void)
+ 	char *ver_str = NULL;
+ 	uint16_t protocol_version = NO_VAL16;
+ 
++	FREE_NULL_LIST(het_reserve_leaders);	/* rebuilt from job records */
++
+ 	/* read the file */
+ 	if (!(buffer = state_save_open("job_state", &state_file))) {
+ 		if ((clustername_existed == 1) && (!ignore_state_errors))
+@@ -1644,6 +1651,8 @@ extern int job_mgr_load_job_state(buf_t *buffer,
+ 
+ 	_add_job_hash(job_ptr);
+ 	_add_job_array_hash(job_ptr);
++	if (job_ptr->het_reserve && (job_ptr->het_job_id == job_ptr->job_id))
++		_het_reserve_add(job_ptr->job_id);	/* --het-reserve */
+ 
+ 	memset(&assoc_rec, 0, sizeof(assoc_rec));
+ 
+@@ -2806,6 +2815,146 @@ static int _find_het_joiner(void *x, void *key)
+ 		!IS_JOB_FINISHED(job_ptr));
+ }
+ 
++/*
++ * sbatch --het-reserve=K: job IDs <leader>+0 .. <leader>+K-1 belong to the
++ * hetjob: its components at submit, then jobs that join it with --het-join.
++ * Joined components keep job_id == het_job_id + het_job_offset, which code
++ * like _walk_jobs_by_selected_step() ("scancel <id>+<offset>") relies on.
++ * The reservation lives in the leader's job record (het_reserve, saved in
++ * the job state) and ends when that record is purged. het_reserve_leaders
++ * lists the leaders holding one, so get_next_job_id() can skip their IDs.
++ */
++static void _het_reserve_add(uint32_t leader_id)
++{
++	uint32_t *id = xmalloc(sizeof(*id));
++
++	*id = leader_id;
++	if (!het_reserve_leaders)
++		het_reserve_leaders = list_create(xfree_ptr);
++	list_append(het_reserve_leaders, id);
++}
++
++typedef struct {
++	uint32_t job_id;
++	job_record_t *leader;
++} het_reserve_find_t;
++
++static int _het_reserve_find(void *x, void *arg)
++{
++	uint32_t leader_id = *(uint32_t *) x;
++	het_reserve_find_t *find = arg;
++	job_record_t *leader;
++
++	if ((find->job_id < leader_id) ||
++	    ((find->job_id - leader_id) >= HET_JOB_RESERVE_MAX))
++		return 0;
++	if (!(leader = find_job_record(leader_id)) ||
++	    ((find->job_id - leader_id) >= leader->het_reserve))
++		return 0;
++	find->leader = leader;
++	return 1;
++}
++
++/* RET the hetjob leader that reserved job_id with --het-reserve, or NULL */
++static job_record_t *_het_reserve_owner(uint32_t job_id)
++{
++	het_reserve_find_t find = { .job_id = job_id };
++
++	if (!het_reserve_leaders)
++		return NULL;
++	(void) list_find_first(het_reserve_leaders, _het_reserve_find, &find);
++	return find.leader;
++}
++
++/* Drop leaders whose record was purged */
++static int _het_reserve_stale(void *x, void *arg)
++{
++	job_record_t *leader = find_job_record(*(uint32_t *) x);
++
++	return (!leader || !leader->het_reserve) ? 1 : 0;
++}
++
++extern void het_job_reserve_ids(job_record_t *het_leader, uint32_t cnt)
++{
++	xassert(het_leader->het_job_id == het_leader->job_id);
++
++	het_leader->het_reserve = cnt;
++	_het_reserve_add(het_leader->job_id);
++}
++
++/*
++ * --het-join: validate a request to join hetjob job_desc->het_join_id and
++ * find the job ID it gets: the lowest free reserved ID <leader>+k, k > 0.
++ * The job is scheduled alone, as an ordinary job, and becomes component +k
++ * when it starts (het_job_attach()).
++ */
++static int _het_join_validate(job_desc_msg_t *job_desc, uint32_t *join_id,
++			      uint32_t *join_offset, char **err_msg)
++{
++	job_record_t *het_leader;
++	uint32_t k;
++
++	/*
++	 * The job ID is the reserved one: an explicit --jobid would make
++	 * _copy_job_desc_to_job_record() drop the join.
++	 */
++	if ((job_desc->het_job_offset != NO_VAL) || !job_desc->script ||
++	    job_desc->array_inx || job_desc->het_reserve ||
++	    (job_desc->job_id != NO_VAL) ||
++	    (job_desc->bitflags & HETJOB_BATCH_EACH)) {
++		if (err_msg)
++			*err_msg = xstrdup("--het-join needs an ordinary batch job (sbatch, no array, no --jobid, no hetjob options)");
++		return ESLURM_NOT_SUPPORTED;
++	}
++	if (fed_mgr_fed_rec) {
++		if (err_msg)
++			*err_msg = xstrdup("--het-join is not supported in a federation");
++		return ESLURM_NOT_SUPPORTED;
++	}
++
++	het_leader = find_job_record(job_desc->het_join_id);
++	if (!het_leader || !het_leader->het_job_list ||
++	    !_het_job_is_leader(het_leader)) {
++		if (err_msg)
++			xstrfmtcat(*err_msg, "--het-join: %u is not a heterogeneous job",
++				   job_desc->het_join_id);
++		return ESLURM_INVALID_JOB_ID;
++	}
++	if (het_leader->user_id != job_desc->user_id) {
++		if (err_msg)
++			xstrfmtcat(*err_msg, "--het-join: hetjob %u belongs to another user",
++				   job_desc->het_join_id);
++		return ESLURM_ACCESS_DENIED;
++	}
++	if (!het_job_batch_each(het_leader) || !het_leader->het_reserve) {
++		if (err_msg)
++			xstrfmtcat(*err_msg, "--het-join: hetjob %u was not submitted with --het-batch=each and --het-reserve",
++				   job_desc->het_join_id);
++		return ESLURM_NOT_SUPPORTED;
++	}
++	if (!list_find_first(het_leader->het_job_list,
++			     _foreach_het_comp_active, NULL)) {
++		if (err_msg)
++			xstrfmtcat(*err_msg, "--het-join: hetjob %u is not running",
++				   job_desc->het_join_id);
++		return ESLURM_JOB_NOT_RUNNING;
++	}
++
++	for (k = 1; k < het_leader->het_reserve; k++) {
++		uint32_t job_id = het_leader->job_id + k;
++
++		if (!find_job_record(job_id) && !_dup_job_file_test(job_id)) {
++			*join_id = job_id;
++			*join_offset = k;
++			return SLURM_SUCCESS;
++		}
++	}
++	if (err_msg)
++		xstrfmtcat(*err_msg, "--het-join: all %u job IDs reserved by hetjob %u are used",
++			   het_leader->het_reserve, job_desc->het_join_id);
++	return ESLURM_INVALID_JOB_ID;
++}
++
+ /*
+  * find_job_record - return a pointer to the job record with the given job_id
+  * IN job_id - requested job's id
+@@ -3988,6 +4137,9 @@ void dump_job_desc(job_desc_msg_t *job_desc)
+ 	debug3("   deadline=%s", buf);
+ 	debug3("   bitflags=0x%"PRIx64" delay_boot=%u",
+ 	       job_desc->bitflags, job_desc->delay_boot);
++	if (job_desc->het_join_id || job_desc->het_reserve)
++		debug3("   het_join_id=%u het_reserve=%u",
++		       job_desc->het_join_id, job_desc->het_reserve);
+ 
+ 	if (job_desc->cpus_per_tres)
+ 		debug3("   CPUs_per_TRES=%s", job_desc->cpus_per_tres);
+@@ -8050,6 +8202,7 @@ static int _job_create(job_desc_msg_t *job_desc, int allocate, int will_run,
+ 	slurmdb_qos_rec_t *qos_ptr;
+ 	uint32_t user_submit_priority, acct_reason = 0;
+ 	uint32_t qos_id = 0;
++	uint32_t het_join_job_id = 0, het_join_offset = 0;
+ 	acct_policy_limit_set_t acct_policy_limit_set;
+ 	assoc_mgr_lock_t assoc_mgr_read_lock = {
+ 		.assoc = READ_LOCK,
+@@ -8102,6 +8255,31 @@ static int _job_create(job_desc_msg_t *job_desc, int allocate, int will_run,
+ 		}
+ 	}
+ 
++	/*
++	 * --het-reserve applies to the leader (other components may carry a
++	 * copy); checked further in _slurm_rpc_submit_batch_het_job()
++	 */
++	if (job_desc->het_reserve &&
++	    ((job_desc->het_job_offset == NO_VAL) ||
++	     (job_desc->het_job_offset == 0))) {
++		if ((job_desc->het_job_offset == NO_VAL) || !job_desc->script ||
++		    !(job_desc->bitflags & HETJOB_BATCH_EACH) ||
++		    (job_desc->het_reserve > HET_JOB_RESERVE_MAX) ||
++		    fed_mgr_fed_rec) {
++			error_code = ESLURM_NOT_SUPPORTED;
++			if (err_msg)
++				xstrfmtcat(*err_msg, "--het-reserve needs a heterogeneous batch job with --het-batch=each, at most %u IDs, no federation",
++					   HET_JOB_RESERVE_MAX);
++			goto cleanup_fail;
++		}
++	}
++
++	/* --het-join: validated here, under the job write lock */
++	if (job_desc->het_join_id &&
++	    ((error_code = _het_join_validate(job_desc, &het_join_job_id,
++					      &het_join_offset, err_msg))))
++		goto cleanup_fail;
++
+ 	/* ensure that selected nodes are in this partition */
+ 	if (job_desc->req_nodes) {
+ 		error_code = node_name2bitmap(job_desc->req_nodes, false,
+@@ -9442,6 +9620,26 @@ static int _copy_job_desc_to_job_record(job_desc_msg_t *job_desc,
+ 
+ 	if (job_desc->job_id != NO_VAL) {	/* already confirmed unique */
+ 		job_ptr->job_id = job_desc->job_id;
++	} else if (job_desc->het_join_id) {
++		/*
++		 * --het-join: a free job ID reserved by the hetjob. Validated
++		 * by _job_create() under the same lock, so this finds the same
++		 * ID.
++		 */
++		uint32_t join_job_id = 0, join_offset = 0;
++
++		if ((error_code = _het_join_validate(job_desc, &join_job_id,
++						     &join_offset, NULL)))
++			return error_code;
++		job_ptr->job_id = join_job_id;
++		job_record_set_sluid(job_ptr);
++		job_ptr->het_join_id = job_desc->het_join_id;
++		job_ptr->het_join_offset = join_offset;
++	} else if (job_desc->het_reserve && (job_desc->het_job_offset == 0)) {
++		/* --het-reserve: hetjob leader, needs a block of free IDs */
++		error_code = _set_job_id_block(job_ptr, job_desc->het_reserve);
++		if (error_code)
++			return error_code;
+ 	} else {
+ 		error_code = _set_job_id(job_ptr);
+ 		if (error_code)
+@@ -10624,6 +10822,11 @@ static int _validate_job_desc(job_desc_msg_t *job_desc_msg, int allocate,
+ 			info("attempt to reuse active %pJ", dup_job_ptr);
+ 			return ESLURM_DUPLICATE_JOB_ID;
+ 		}
++		if ((dup_job_ptr = _het_reserve_owner(job_desc_msg->job_id))) {
++			info("attempt to use JobId=%u reserved by %pJ",
++			     job_desc_msg->job_id, dup_job_ptr);
++			return ESLURM_DUPLICATE_JOB_ID;
++		}
+ 	}
+ 
+ 	if (job_desc_msg->nice == NO_VAL)
+@@ -11466,6 +11669,8 @@ void pack_job(job_record_t *dump_job_ptr, uint16_t show_flags, buf_t *buffer,
+ 			pack32(dump_job_ptr->het_join_offset, buffer);
+ 			pack32(dump_job_ptr->het_batch_restart, buffer);
+ 		}
++		if (protocol_version >= SLURM_25_05_HETFT2_PROTOCOL_VERSION)
++			pack32(dump_job_ptr->het_reserve, buffer);
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_record_pack_common(dump_job_ptr, false, buffer,
+ 				       protocol_version);
+@@ -12677,6 +12882,9 @@ void purge_old_job(void)
+ 	fed_mgr_test_remote_dependencies();
+ 
+ 	i = list_delete_all(job_list, &_list_find_job_old, "");
++	if (i && het_reserve_leaders)	/* --het-reserve of purged hetjobs */
++		(void) list_delete_all(het_reserve_leaders,
++				       _het_reserve_stale, NULL);
+ 	if (i) {
+ 		debug2("purge_old_job: purged %d old job records", i);
+ 		last_job_update = time(NULL);
+@@ -12776,6 +12984,10 @@ extern uint32_t get_next_job_id(bool test_only)
+ 			tmp_id_sequence++;
+ 			continue;
+ 		}
++		if (_het_reserve_owner(new_id)) {	/* --het-reserve */
++			tmp_id_sequence++;
++			continue;
++		}
+ 		if (_dup_job_file_test(new_id)) {
+ 			tmp_id_sequence++;
+ 			continue;
+@@ -12816,6 +13028,47 @@ static int _set_job_id(job_record_t *job_ptr)
+ 	return EAGAIN;
+ }
+ 
++static bool _job_id_free(uint32_t job_id)
++{
++	return ((job_id >= slurm_conf.first_job_id) &&
++		(job_id < slurm_conf.max_job_id) &&
++		!find_job_record(job_id) && !_het_reserve_owner(job_id) &&
++		!_dup_job_file_test(job_id));
++}
++
++/*
++ * --het-reserve=cnt on a hetjob leader: like _set_job_id(), but take the
++ * lowest job ID for which job_id .. job_id + cnt - 1 are all free. The
++ * components submitted with the leader then get job_id + offset from
++ * get_next_job_id() (same lock), and the rest stays reserved.
++ */
++static int _set_job_id_block(job_record_t *job_ptr, uint32_t cnt)
++{
++	uint32_t base, k, max_jobs;
++
++	max_jobs = slurm_conf.max_job_id - slurm_conf.first_job_id;
++	for (uint32_t tries = 0; tries < max_jobs; tries++) {
++		if ((base = get_next_job_id(true)) == SLURM_ERROR)
++			break;
++		for (k = 1; k < cnt; k++) {
++			if (!_job_id_free(base + k))
++				break;
++		}
++		if (k == cnt) {
++			job_id_sequence = base + 1;
++			job_ptr->job_id = base;
++			job_record_set_sluid(job_ptr);
++			return SLURM_SUCCESS;
++		}
++		/* Skip past the ID in use and try again */
++		job_id_sequence = base + k + 1;
++		tries += k;
++	}
++
++	job_ptr->job_id = NO_VAL;
++	return EAGAIN;
++}
++
+ 
+ /*
+  * set_job_prio - set a default job priority
+@@ -17676,6 +17929,7 @@ void job_fini (void)
+ 	xfree(job_array_hash_t);
+ 	FREE_NULL_LIST(purge_jobs_list);
+ 	FREE_NULL_LIST(purge_files_list);
++	FREE_NULL_LIST(het_reserve_leaders);
+ 	FREE_NULL_BITMAP(requeue_exit);
+ 	FREE_NULL_BITMAP(requeue_exit_hold);
+ }
+diff --git a/src/slurmctld/proc_req.c b/src/slurmctld/proc_req.c
+index 55518c4..015f0ed 100644
+--- a/src/slurmctld/proc_req.c
++++ b/src/slurmctld/proc_req.c
+@@ -3923,6 +3923,41 @@ static void _slurm_rpc_submit_batch_het_job(slurm_msg_t *msg)
+ 		reject_job = true;
+ 	}
+ 
++	/*
++	 * --het-reserve=K: the leader got the first of K free job IDs, so the
++	 * components got leader+1, leader+2, ...; reserve the rest for jobs
++	 * joining later with --het-join (job_id == het_job_id + offset).
++	 */
++	if (!reject_job && first_job_ptr &&
++	    (job_desc_msg = list_peek(job_req_list)) &&
++	    job_desc_msg->het_reserve) {
++		uint32_t comp_cnt = list_count(submit_job_list);
++
++		iter = list_iterator_create(submit_job_list);
++		while ((job_ptr = list_next(iter))) {
++			if (job_ptr->job_id !=
++			    (het_job_id + job_ptr->het_job_offset))
++				break;
++		}
++		list_iterator_destroy(iter);
++		if (job_desc_msg->het_reserve < comp_cnt) {
++			xstrfmtcat(job_submit_user_msg, "%s--het-reserve=%u is less than the %u components",
++				   job_submit_user_msg ? "\n" : "",
++				   job_desc_msg->het_reserve, comp_cnt);
++			error_code = ESLURM_INVALID_JOB_ID;
++			reject_job = true;
++		} else if (job_ptr) {
++			error("%s: hetjob %u component %pJ is not at job ID %u+%u",
++			      __func__, het_job_id, job_ptr, het_job_id,
++			      job_ptr->het_job_offset);
++			error_code = ESLURM_INVALID_JOB_ID;
++			reject_job = true;
++		} else {
++			het_job_reserve_ids(first_job_ptr,
++					    job_desc_msg->het_reserve);
++		}
++	}
++
+ 	_create_het_job_id_set(jobid_hostset, het_job_offset,
+ 			       &het_job_id_set);
+ 	if (first_job_ptr)
+diff --git a/src/slurmctld/slurmctld.h b/src/slurmctld/slurmctld.h
+index b29e9f0..f91ee7b 100644
+--- a/src/slurmctld/slurmctld.h
++++ b/src/slurmctld/slurmctld.h
+@@ -802,6 +802,14 @@ extern int het_job_join_test(job_record_t *job_ptr);
+  */
+ extern void het_job_attach(job_record_t *job_ptr);
+ 
++/*
++ * het_job_reserve_ids - reserve job IDs het_leader->job_id + 0 .. cnt - 1 for
++ *	the hetjob (sbatch --het-reserve), for jobs joining it later with
++ *	--het-join. The job ID allocator skips them while the leader record
++ *	exists.
++ */
++extern void het_job_reserve_ids(job_record_t *het_leader, uint32_t cnt);
++
+ /*
+  * find_job_record - return a pointer to the job record with the given job_id
+  * IN job_id - requested job's id
