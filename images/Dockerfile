@@ -32,6 +32,10 @@ ARG CONDA_VERSION=py313_25.7.0-2
 ARG MICROMAMBA_VERSION=2.3.2-0
 ARG NHC_VERSION=1.4.3
 
+# Use the exact compute runtime's CUDA headers/stubs only while compiling.
+# The driver library is provided by the GPU host, never by this build stub.
+FROM $COMPUTE_RUNTIME_IMAGE AS nvml-build-input
+
 FROM $PARENT_IMAGE AS builder
 
 ARG LIBJSON_VERSION
@@ -131,6 +135,8 @@ RUN make
 RUN make install
 
 FROM builder AS slurm-builder
+COPY --from=nvml-build-input /usr/local/cuda-12.9/targets/x86_64-linux/include/nvml.h /opt/nvml/include/nvml.h
+COPY --from=nvml-build-input /usr/local/cuda-12.9/targets/x86_64-linux/lib/stubs/libnvidia-ml.so /opt/nvml/lib64/stubs/libnvidia-ml.so
 # Slum version can be release version (ex. 22.05.7) or full git commit sha
 ARG SLURM_VERSION
 WORKDIR /build
@@ -154,7 +160,7 @@ WORKDIR /build/slurm-$SLURM_VERSION
 RUN arch=$(uname -m) && \
   ./configure --prefix=/usr --libdir=/usr/lib/${arch}-linux-gnu --sysconfdir=/etc/slurm \
   --enable-pam --with-pam_dir=/usr/lib/${arch}-linux-gnu/security \
-  --with-hdf5 --disable-glibtest --disable-gtktest \
+  --with-hdf5 --disable-glibtest --disable-gtktest --with-nvml=/opt/nvml \
   --with-pmix=/usr/lib/${arch}-linux-gnu/$SLURM_PMIX_VERSION \
   --with-json=yes --with-yaml=yes --with-http-parser=yes --with-jwt=/usr/local/ --with-bpf=yes
 COPY build/Makefile.docs doc/Makefile

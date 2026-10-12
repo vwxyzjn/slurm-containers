@@ -17,6 +17,14 @@ The same complete Slurm install and newly built Pyxis are copied into four
 digest-pinned runtimes. No package-manager upgrade or replacement of CUDA,
 NCCL, Enroot, conda, NHC, or other runtime extras is performed.
 
+The common Slurm build explicitly enables NVML using CUDA 12.9's header and
+link stub from the pinned compute runtime. This rebuilds `gpu_nvml.so`
+against the same patched Slurm source instead of leaving the compute base's
+old plugin behind. Those build inputs live only in `/opt/nvml` in the build
+stage and are never copied into runtime images. The plugin loads the real
+host driver's `libnvidia-ml.so` at runtime; a local CPU-only build does not
+exercise GPU discovery or allocation.
+
 | Docker target | Preserved runtime |
 | --- | --- |
 | `controller-rebuilt-slurm` | CW2's deployed joblaunch10 controller |
