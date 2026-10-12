@@ -1,5 +1,9 @@
 # Slurm Patches
 
+The RL candidate adds `0039`–`0042` after the complete stack through `0038`.
+See [CW2 fault-tolerance images](../../RLFT_IMAGES.md) for the four pinned
+runtime builds and the required coordinated Slurm protocol/state upgrade.
+
 The next controller candidate adds `0037-array-launch-transactions.patch` to
 the `joblaunch9` stack. It gives array tasks independent, bounded preemption
 plans and owner-aware concurrency slots. See [ARRAY_PREEMPTION.md](ARRAY_PREEMPTION.md)

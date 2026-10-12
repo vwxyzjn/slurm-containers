@@ -1,0 +1,2601 @@
+diff --git a/doc/man/man1/sbatch.1 b/doc/man/man1/sbatch.1
+index ee317c6..6714d01 100644
+--- a/doc/man/man1/sbatch.1
++++ b/doc/man/man1/sbatch.1
+@@ -1323,6 +1323,34 @@ show this help message
+ .RE
+ .IP
+ 
++.TP
++\fB\-\-het\-batch\fR={\fIleader\fR|\fIeach\fR}
++Heterogeneous jobs only. With \fIleader\fR (the default) the batch script runs
++once, on the first node of the first component, and the heterogeneous job ends
++when it exits. With \fIeach\fR the batch script runs on the first node of every
++component, with \fBSLURM_HET_JOB_ID\fR and \fBSLURM_HET_JOB_OFFSET\fR set and
++only that component's allocation in its environment, so \fBsrun\fR in the
++script runs in that component. Each component then ends on its own: when its
++batch script exits, when it loses a node it can not run without (NODE_FAIL), or
++with "\fIscancel <job_id>+<offset>\fR". A component other than the first can
++also be requeued alone ("\fIscontrol requeue <job_id>+<offset>\fR"); it waits
++in the queue as an ordinary job and becomes a component again when it starts.
++The heterogeneous job lasts until its last component ends, and
++"\fIscancel <job_id>\fR" still cancels every component.
++A component with \fB\-\-no\-kill\fR that loses the node running its batch
++script, and still has other nodes, keeps running: its batch script is run
++again on the first of its remaining nodes, with \fBSLURM_HET_BATCH_RESTART\fR
++set, while its job steps on the other nodes keep running. The script must
++expect this (for instance, not start steps again on nodes that still run
++them).
++\fBSchedulerParameters=whole_hetjob\fR does not apply to such a job.
++"\fIscontrol requeue <job_id>\fR" requeues the whole heterogeneous job only if
++every component can be requeued, and is refused otherwise. A burst buffer
++(\fB\-\-bb\fR) is only allowed on the first component.
++Must be enabled with \fBSchedulerParameters=het_batch_each\fR. Set it on the
++command line or in the first component's options; it applies to all components.
++.IP
++
+ .TP
+ \fB\-H, \-\-hold\fR
+ Specify the job is to be submitted in a held state (priority of zero).
+@@ -3260,6 +3288,26 @@ it is set \- consult the appropriate documentation for 3rd party software).
+ .TP
+ \fBSLURM_HET_SIZE\fR
+ Set to count of components in heterogeneous job.
++Not set with \fB\-\-het\-batch\fR=\fIeach\fR.
++.IP
++
++.TP
++\fBSLURM_HET_JOB_ID\fR
++With \fB\-\-het\-batch\fR=\fIeach\fR, the job ID of the heterogeneous job
++(its first component).
++.IP
++
++.TP
++\fBSLURM_HET_JOB_OFFSET\fR
++With \fB\-\-het\-batch\fR=\fIeach\fR, the offset of the component this batch
++script runs in. The component is "\fISLURM_HET_JOB_ID+SLURM_HET_JOB_OFFSET\fR".
++.IP
++
++.TP
++\fBSLURM_HET_BATCH_RESTART\fR
++With \fB\-\-het\-batch\fR=\fIeach\fR, set when the batch script was started
++again on a new node after the component lost the node that ran it: the number
++of such restarts of this component, from 1. Not set at the first launch.
+ .IP
+ 
+ .TP
+diff --git a/doc/man/man5/slurm.conf.5 b/doc/man/man5/slurm.conf.5
+index 02cfea9..cd81074 100644
+--- a/doc/man/man5/slurm.conf.5
++++ b/doc/man/man5/slurm.conf.5
+@@ -4470,6 +4470,12 @@ Enable job steps that span heterogeneous job allocations.
+ The default value.
+ .IP
+ 
++.TP
++\fBhet_batch_each\fR
++Allow \fBsbatch \-\-het\-batch=each\fR: every component of a heterogeneous
++job runs its own batch script and ends on its own. See \fBsbatch\fR(1).
++.IP
++
+ .TP
+ \fBhet_component_node_fail\fR
+ When a node fails, only the heterogeneous job component that holds the node is
+diff --git a/slurm/slurm.h b/slurm/slurm.h
+index 43a5ff8..173408a 100644
+--- a/slurm/slurm.h
++++ b/slurm/slurm.h
+@@ -1199,6 +1199,9 @@ enum node_states {
+ #define GRES_ALLOW_TASK_SHARING SLURM_BIT(40) /* Allow tasks to share gres */
+ #define STEPMGR_ENABLED SLURM_BIT(41) /* enable(d) stepmgr or not */
+ #define HETJOB_PURGE SLURM_BIT(42) /* purge the hetjob component */
++#define HETJOB_BATCH_EACH SLURM_BIT(43) /* every hetjob component runs its
++					* own batch script, set by
++					* sbatch --het-batch=each */
+ 
+ /* These bits are set in the x11 field of job_desc_msg_t */
+ #define X11_FORWARD_ALL		0x0001	/* all nodes should setup forward */
+@@ -1841,6 +1844,11 @@ typedef struct job_info {
+ 	uint32_t het_job_id;	/* job ID of hetjob leader */
+ 	char *het_job_id_set;	/* job IDs for all components */
+ 	uint32_t het_job_offset; /* HetJob component offset from leader */
++	uint32_t het_join_id;	/* pending job that (re)joins this hetjob
++				 * leader when it starts, 0 if none */
++	uint32_t het_join_offset; /* component offset it joins as */
++	uint32_t het_batch_restart; /* --het-batch=each: batch script relaunches
++				     * after a lost batch host */
+ 	uint32_t job_id;	/* job ID */
+ 	job_resources_t *job_resrcs; /* opaque data type, job resources */
+ 	char *job_size_str;
+diff --git a/src/common/assoc_mgr.c b/src/common/assoc_mgr.c
+index 81cff36..948d4cd 100644
+--- a/src/common/assoc_mgr.c
++++ b/src/common/assoc_mgr.c
+@@ -5798,13 +5798,13 @@ extern int dump_assoc_mgr_state(void)
+ 	buffer = init_buf(high_buffer_size);
+ 
+ 	/* write header: version, time */
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	assoc_mgr_lock(&locks);
+ 	if (assoc_mgr_tres_list) {
+ 		dbd_list_msg_t msg = { .my_list = assoc_mgr_tres_list };
+-		slurmdbd_pack_list_msg(&msg, SLURM_PROTOCOL_VERSION,
++		slurmdbd_pack_list_msg(&msg, SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       DBD_ADD_TRES, buffer);
+ 	}
+ 
+@@ -5816,14 +5816,14 @@ extern int dump_assoc_mgr_state(void)
+ 	buffer = init_buf(high_buffer_size);
+ 
+ 	/* write header: version, time */
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	if (assoc_mgr_user_list) {
+ 		dbd_list_msg_t msg = { .my_list = assoc_mgr_user_list };
+ 		/* let us know what to unpack */
+ 		pack16(DBD_ADD_USERS, buffer);
+-		slurmdbd_pack_list_msg(&msg, SLURM_PROTOCOL_VERSION,
++		slurmdbd_pack_list_msg(&msg, SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       DBD_ADD_USERS, buffer);
+ 	}
+ 
+@@ -5831,7 +5831,7 @@ extern int dump_assoc_mgr_state(void)
+ 		dbd_list_msg_t msg = { .my_list = assoc_mgr_res_list };
+ 		/* let us know what to unpack */
+ 		pack16(DBD_ADD_RES, buffer);
+-		slurmdbd_pack_list_msg(&msg, SLURM_PROTOCOL_VERSION,
++		slurmdbd_pack_list_msg(&msg, SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       DBD_ADD_RES, buffer);
+ 	}
+ 
+@@ -5839,7 +5839,7 @@ extern int dump_assoc_mgr_state(void)
+ 		dbd_list_msg_t msg = { .my_list = assoc_mgr_qos_list };
+ 		/* let us know what to unpack */
+ 		pack16(DBD_ADD_QOS, buffer);
+-		slurmdbd_pack_list_msg(&msg, SLURM_PROTOCOL_VERSION,
++		slurmdbd_pack_list_msg(&msg, SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       DBD_ADD_QOS, buffer);
+ 	}
+ 
+@@ -5847,7 +5847,7 @@ extern int dump_assoc_mgr_state(void)
+ 		dbd_list_msg_t msg = { .my_list = assoc_mgr_wckey_list };
+ 		/* let us know what to unpack */
+ 		pack16(DBD_ADD_WCKEYS, buffer);
+-		slurmdbd_pack_list_msg(&msg, SLURM_PROTOCOL_VERSION,
++		slurmdbd_pack_list_msg(&msg, SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       DBD_ADD_WCKEYS, buffer);
+ 	}
+ 	/* this needs to be done last so qos is set up
+@@ -5856,7 +5856,7 @@ extern int dump_assoc_mgr_state(void)
+ 		dbd_list_msg_t msg = { .my_list = assoc_mgr_assoc_list };
+ 		/* let us know what to unpack */
+ 		pack16(DBD_ADD_ASSOCS, buffer);
+-		slurmdbd_pack_list_msg(&msg, SLURM_PROTOCOL_VERSION,
++		slurmdbd_pack_list_msg(&msg, SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       DBD_ADD_ASSOCS, buffer);
+ 	}
+ 
+@@ -5867,7 +5867,7 @@ extern int dump_assoc_mgr_state(void)
+ 
+ 	buffer = init_buf(high_buffer_size);
+ 	/* write header: version, time */
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	if (assoc_mgr_assoc_list) {
+@@ -5896,7 +5896,7 @@ extern int dump_assoc_mgr_state(void)
+ 
+ 	buffer = init_buf(high_buffer_size);
+ 	/* write header: version, time */
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	if (assoc_mgr_qos_list) {
+diff --git a/src/common/job_record.c b/src/common/job_record.c
+index d8b649e..d07cd57 100644
+--- a/src/common/job_record.c
++++ b/src/common/job_record.c
+@@ -2602,6 +2602,12 @@ extern int job_record_pack(job_record_t *dump_job_ptr,
+ 		} else {
+ 			packbool(false, buffer);
+ 		}
++
++		if (protocol_version >= SLURM_25_05_HETFT1_PROTOCOL_VERSION) {
++			pack32(dump_job_ptr->het_join_id, buffer);
++			pack32(dump_job_ptr->het_join_offset, buffer);
++			pack32(dump_job_ptr->het_batch_restart, buffer);
++		}
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_record_pack_common(dump_job_ptr, true, buffer,
+ 				       protocol_version);
+@@ -3089,6 +3095,12 @@ extern int job_record_unpack(job_record_t **out,
+ 			assoc_mgr_set_uid(job_ptr->user_id,
+ 					  job_ptr->id->pw_name);
+ 		}
++
++		if (protocol_version >= SLURM_25_05_HETFT1_PROTOCOL_VERSION) {
++			safe_unpack32(&job_ptr->het_join_id, buffer);
++			safe_unpack32(&job_ptr->het_join_offset, buffer);
++			safe_unpack32(&job_ptr->het_batch_restart, buffer);
++		}
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_record_unpack_common(job_ptr, buffer, protocol_version);
+ 
+diff --git a/src/common/job_record.h b/src/common/job_record.h
+index 5048b78..2cfca3b 100644
+--- a/src/common/job_record.h
++++ b/src/common/job_record.h
+@@ -328,6 +328,14 @@ struct job_record {
+ 	uint32_t het_job_offset;	/* HetJob component index */
+ 	list_t *het_job_list;		/* List of job pointers to all
+ 					 * components */
++	uint32_t het_join_id;		/* HETJOB_BATCH_EACH: pending job that
++					 * is attached to this hetjob leader
++					 * as a component when it starts
++					 * (a requeued component), 0 if none */
++	uint32_t het_join_offset;	/* component offset it rejoins as */
++	uint32_t het_batch_restart;	/* HETJOB_BATCH_EACH: times the batch
++					 * script was relaunched on a new
++					 * batch host after losing its own */
+ 	uint32_t job_id;		/* job ID */
+ 	identity_t *id;			/* job identity */
+ 	job_record_t *job_next;		/* next entry with same hash index */
+diff --git a/src/common/slurm_opt.c b/src/common/slurm_opt.c
+index f956cfd..e80c221 100644
+--- a/src/common/slurm_opt.c
++++ b/src/common/slurm_opt.c
+@@ -2123,6 +2123,44 @@ static slurm_cli_opt_t slurm_opt_kill_on_invalid_dep = {
+ 	.reset_func = arg_reset_kill_on_invalid_dep,
+ };
+ 
++/*
++ * --het-batch=leader|each (sbatch, heterogeneous jobs): "each" runs the batch
++ * script on the first node of every component, with SLURM_HET_JOB_OFFSET set,
++ * and lets every component end on its own. Carried in job_desc_msg_t.bitflags
++ * as HETJOB_BATCH_EACH, like --spread-job and --use-min-nodes.
++ */
++static int arg_set_het_batch(slurm_opt_t *opt, const char *arg)
++{
++	if (!xstrcasecmp(arg, "each"))
++		opt->job_flags |= HETJOB_BATCH_EACH;
++	else if (!xstrcasecmp(arg, "leader"))
++		opt->job_flags &= ~HETJOB_BATCH_EACH;
++	else {
++		error("Invalid --het-batch specification, use \"leader\" or \"each\"");
++		return SLURM_ERROR;
++	}
++
++	return SLURM_SUCCESS;
++}
++static char *arg_get_het_batch(slurm_opt_t *opt)
++{
++	if (opt->job_flags & HETJOB_BATCH_EACH)
++		return xstrdup("each");
++	return xstrdup("leader");
++}
++static void arg_reset_het_batch(slurm_opt_t *opt)
++{
++	opt->job_flags &= ~HETJOB_BATCH_EACH;
++}
++static slurm_cli_opt_t slurm_opt_het_batch = {
++	.name = "het-batch",
++	.has_arg = required_argument,
++	.val = LONG_OPT_HET_BATCH,
++	.set_func_sbatch = arg_set_het_batch,
++	.get_func = arg_get_het_batch,
++	.reset_func = arg_reset_het_batch,
++};
++
+ COMMON_SRUN_BOOL_OPTION(labelio);
+ static slurm_cli_opt_t slurm_opt_label = {
+ 	.name = "label",
+@@ -4202,6 +4240,7 @@ static const slurm_cli_opt_t *common_options[] = {
+ 	&slurm_opt_gres,
+ 	&slurm_opt_gres_flags,
+ 	&slurm_opt_help,
++	&slurm_opt_het_batch,
+ 	&slurm_opt_het_group,
+ 	&slurm_opt_hint,
+ 	&slurm_opt_hold,
+diff --git a/src/common/slurm_opt.h b/src/common/slurm_opt.h
+index 85c0412..29dcbaa 100644
+--- a/src/common/slurm_opt.h
++++ b/src/common/slurm_opt.h
+@@ -199,6 +199,7 @@ enum {
+ 	LONG_OPT_WHOLE,
+ 	LONG_OPT_WRAP,
+ 	LONG_OPT_X11,
++	LONG_OPT_HET_BATCH,
+ 	LONG_OPT_ENUM_END
+ };
+ 
+diff --git a/src/common/slurm_protocol_common.h b/src/common/slurm_protocol_common.h
+index ab9f55f..5edd5d5 100644
+--- a/src/common/slurm_protocol_common.h
++++ b/src/common/slurm_protocol_common.h
+@@ -59,14 +59,32 @@
+  * files since they don't update once they are created.
+  */
+ #define SLURM_25_05_PROTOCOL_VERSION ((43 << 8) | 0)
++/*
++ * Periodic hetjob fault tolerance patches on top of 25.05 (HETFT): the 25.05
++ * wire and state formats plus fields appended at the end of the 25.05 blocks,
++ * guarded by these versions. The major byte stays 43 so all 25.05 checks keep
++ * matching; stock 25.05 peers keep talking 25.05 and never see the new fields.
++ *   HETFT1: job_record_t/job_info het_join_id, het_join_offset,
++ *           het_batch_restart
++ */
++#define SLURM_25_05_HETFT1_PROTOCOL_VERSION ((43 << 8) | 1)
+ #define SLURM_24_11_PROTOCOL_VERSION ((42 << 8) | 0)
+ #define SLURM_24_05_PROTOCOL_VERSION ((41 << 8) | 0)
+ #define SLURM_23_11_PROTOCOL_VERSION ((40 << 8) | 0)
+ 
+-#define SLURM_PROTOCOL_VERSION SLURM_25_05_PROTOCOL_VERSION
++#define SLURM_PROTOCOL_VERSION SLURM_25_05_HETFT1_PROTOCOL_VERSION
+ #define SLURM_ONE_BACK_PROTOCOL_VERSION SLURM_24_11_PROTOCOL_VERSION
+ #define SLURM_TWO_BACK_PROTOCOL_VERSION SLURM_24_05_PROTOCOL_VERSION
+ #define SLURM_MIN_PROTOCOL_VERSION SLURM_23_11_PROTOCOL_VERSION
++/*
++ * HETFT: the version written into the slurmctld state files whose format the
++ * HETFT versions do not change, which is all of them but job_state (node,
++ * partition, reservation, trigger, federation, last_config_lite and the
++ * assoc_mgr files). Several stock loaders refuse a newer version (fatal()
++ * unless -i), so these files stay at 25.05 and a stock 25.05 slurmctld can
++ * still read them after a rollback. Only job_state carries HETFT fields.
++ */
++#define SLURM_STOCK_STATE_PROTOCOL_VERSION SLURM_25_05_PROTOCOL_VERSION
+ 
+ #if 0
+ /* Old Slurm versions kept for reference only.  Slurm only actively keeps track
+diff --git a/src/common/slurm_protocol_pack.c b/src/common/slurm_protocol_pack.c
+index 84de2fb..e587c5b 100644
+--- a/src/common/slurm_protocol_pack.c
++++ b/src/common/slurm_protocol_pack.c
+@@ -207,8 +207,13 @@ int unpack_header(header_t *header, buf_t *buffer)
+ 
+ 	safe_unpack16(&header->version, buffer);
+ 
+-	/* Slurm supports the current RPC version, plus three prior. */
++	/*
++	 * Slurm supports the current RPC version, plus three prior. Stock
++	 * 25.05 peers send SLURM_25_05_PROTOCOL_VERSION, older than the HETFT
++	 * version this build speaks.
++	 */
+ 	if ((header->version != SLURM_PROTOCOL_VERSION) &&
++	    (header->version != SLURM_25_05_PROTOCOL_VERSION) &&
+ 	    (header->version != SLURM_ONE_BACK_PROTOCOL_VERSION) &&
+ 	    (header->version != SLURM_TWO_BACK_PROTOCOL_VERSION) &&
+ 	    (header->version != SLURM_MIN_PROTOCOL_VERSION)) {
+@@ -3591,6 +3596,12 @@ _unpack_job_info_members(job_info_t * job, buf_t *buffer,
+ 			job->ntasks_per_core = mc_ptr->ntasks_per_core;
+ 			xfree(mc_ptr);
+ 		}
++
++		if (protocol_version >= SLURM_25_05_HETFT1_PROTOCOL_VERSION) {
++			safe_unpack32(&job->het_join_id, buffer);
++			safe_unpack32(&job->het_join_offset, buffer);
++			safe_unpack32(&job->het_batch_restart, buffer);
++		}
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		/* job_record_pack_common */
+ 		safe_unpackstr(&job->account, buffer);
+diff --git a/src/sbatch/opt.c b/src/sbatch/opt.c
+index 86a4ee5..6895ba9 100644
+--- a/src/sbatch/opt.c
++++ b/src/sbatch/opt.c
+@@ -1132,6 +1132,8 @@ static void _help(void)
+ "      --gid=group_id          group ID to run job as (user root only)\n"
+ "      --gres=list             required generic resources per node\n"
+ "      --gres-flags=opts       flags related to GRES management\n"
++"      --het-batch=leader|each run the batch script on the leader only, or\n"
++"                              on every component of a heterogeneous job\n"
+ "  -H, --hold                  submit job in held state\n"
+ "      --ignore-pbs            Ignore #PBS and #BSUB options in the batch script\n"
+ "  -i, --input=in              file for batch script's standard input\n"
+diff --git a/src/scancel/opt.c b/src/scancel/opt.c
+index af90771..57c4236 100644
+--- a/src/scancel/opt.c
++++ b/src/scancel/opt.c
+@@ -200,6 +200,7 @@ static void _opt_default(void)
+ 	opt.batch	= false;
+ 	opt.clusters    = NULL;
+ 	opt.ctld	= false;
++	opt.het_comp	= false;
+ 	opt.cron = false;
+ 	opt.full	= false;
+ 	opt.hurry	= false;
+@@ -587,6 +588,11 @@ _xlate_job_step_ids(char **rest)
+ 				exit (1);
+ 			}
+ 			opt.array_id[buf_offset] = NO_VAL;
++			/*
++			 * The offset is not kept in the arrays below: only
++			 * slurmctld resolves <id>+<offset> (see _proc_cluster()).
++			 */
++			opt.het_comp = true;
+ 		} else {
+ 			opt.array_id[buf_offset] = NO_VAL;
+ 		}
+diff --git a/src/scancel/scancel.c b/src/scancel/scancel.c
+index cba38f3..d672efc 100644
+--- a/src/scancel/scancel.c
++++ b/src/scancel/scancel.c
+@@ -344,8 +344,18 @@ _proc_cluster(void)
+ 	/*
+ 	 * TODO:
+ 	 * Remove sibling restriction once --ctld has this logic implemented.
++	 *
++	 * A hetjob component (<id>+<offset>) with any option that leads here
++	 * (filters such as --user or --name, --signal, --batch, ...): the
++	 * code below matches records by job ID and drops the offset, so it
++	 * would signal <id>, the whole hetjob, through its leader. Let
++	 * slurmctld resolve <id>+<offset> and apply the filters
++	 * (REQUEST_KILL_JOBS, as with --ctld). With the job IDs alone,
++	 * <id>+<offset> already goes to slurmctld as given
++	 * (_signal_job_by_str() above).
+ 	 */
+-	if (opt.ctld && !(opt.sibling || has_job_steps() || has_fed_jobs()))
++	if ((opt.ctld || (opt.het_comp && !opt.interactive)) &&
++	    !(opt.sibling || has_job_steps() || has_fed_jobs()))
+ 		return _ctld_signal_jobs();
+ 
+ 	_load_job_records();
+diff --git a/src/scancel/scancel.h b/src/scancel/scancel.h
+index df16f9d..3517daa 100644
+--- a/src/scancel/scancel.h
++++ b/src/scancel/scancel.h
+@@ -48,6 +48,8 @@ typedef struct scancel_options {
+ 	bool batch;		/* --batch, -b			*/
+ 	char *sibling;		/* --sibling=<sib_name>		*/
+ 	bool ctld;		/* --ctld			*/
++	bool het_comp;		/* a job ID names a hetjob component
++				 * (<id>+<offset>)		*/
+ 	list_t *clusters;	/* --cluster=cluster_name -Mcluster-name */
+ 	bool cron;		/* --cron */
+ 	bool full;		/* --full, -f			*/
+diff --git a/src/scontrol/info_job.c b/src/scontrol/info_job.c
+index 04431b2..168fda7 100644
+--- a/src/scontrol/info_job.c
++++ b/src/scontrol/info_job.c
+@@ -193,6 +193,28 @@ static char *_sprint_job_info(job_info_t *job_ptr)
+ 		xstrcat(out, line_end);
+ 	}
+ 
++	/****** Line (optional) ******/
++	if ((job_ptr->bitflags & HETJOB_BATCH_EACH) || job_ptr->het_join_id) {
++		char *sep = "";
++
++		if (job_ptr->bitflags & HETJOB_BATCH_EACH) {
++			xstrcat(out, "HetBatch=each");
++			sep = " ";
++		}
++		/* batch script relaunched after its batch host was lost */
++		if (job_ptr->het_batch_restart) {
++			xstrfmtcat(out, "%sHetBatchRestart=%u", sep,
++				   job_ptr->het_batch_restart);
++			sep = " ";
++		}
++		/* pending: starts as this component of hetjob het_join_id */
++		if (job_ptr->het_join_id)
++			xstrfmtcat(out, "%sHetJoin=%u+%u", sep,
++				   job_ptr->het_join_id,
++				   job_ptr->het_join_offset);
++		xstrcat(out, line_end);
++	}
++
+ 	/****** Line ******/
+ 	user_name = uid_to_string((uid_t) job_ptr->user_id);
+ 	group_name = gid_to_string((gid_t) job_ptr->group_id);
+diff --git a/src/slurmctld/agent.c b/src/slurmctld/agent.c
+index 197a51e..4ee4fb0 100644
+--- a/src/slurmctld/agent.c
++++ b/src/slurmctld/agent.c
+@@ -739,6 +739,34 @@ static void _notify_slurmctld_jobs(agent_info_t *agent_ptr)
+ 		_queue_update_srun(&step_id);
+ }
+ 
++/*
++ * The node a REQUEST_BATCH_JOB_LAUNCH that got no response was sent to:
++ * launch_job() sends it to one node, the job's batch host. NULL if not known.
++ * Called with agent_ptr->thread_mutex held, after the threads are done.
++ */
++static char *_batch_launch_no_resp_node(agent_info_t *agent_ptr)
++{
++	thd_t *thread_ptr = agent_ptr->thread_struct;
++	ret_data_info_t *ret_data_info;
++	list_itr_t *itr;
++	char *node_name = NULL;
++
++	if (!thread_ptr || (agent_ptr->thread_count < 1))
++		return NULL;
++	if (!thread_ptr[0].ret_list)
++		return thread_ptr[0].nodename;
++	itr = list_iterator_create(thread_ptr[0].ret_list);
++	while ((ret_data_info = list_next(itr))) {
++		if ((ret_data_info->err == DSH_NO_RESP) &&
++		    ret_data_info->node_name) {
++			node_name = ret_data_info->node_name;
++			break;
++		}
++	}
++	list_iterator_destroy(itr);
++	return node_name;
++}
++
+ static void _notify_slurmctld_nodes(agent_info_t *agent_ptr,
+ 				    int no_resp_cnt, int retry_cnt)
+ {
+@@ -768,8 +796,15 @@ static void _notify_slurmctld_nodes(agent_info_t *agent_ptr,
+ 				  .fed  = READ_LOCK };
+ 
+ 			lock_slurmctld(job_write_lock);
+-			job_complete(job_id, slurm_conf.slurm_user_id,
+-				     true, false, 0);
++			/*
++			 * --het-batch=each: not for a superseded launch, nor
++			 * for a relaunch whose node will be marked DOWN
++			 */
++			if (!het_batch_launch_fail_ignore(
++				    job_id, _batch_launch_no_resp_node(agent_ptr),
++				    launch_msg_ptr->restart_cnt, true))
++				job_complete(job_id, slurm_conf.slurm_user_id,
++					     true, false, 0);
+ 			unlock_slurmctld(job_write_lock);
+ 		}
+ 	}
+@@ -1100,13 +1135,18 @@ static void *_thread_per_group_rpc(void *args)
+ 			batch_job_launch_msg_t *launch_msg_ptr =
+ 				task_ptr->msg_args_ptr;
+ 			job_id = launch_msg_ptr->job_id;
+-			info("Killing non-startable batch JobId=%u: %s",
+-			     job_id, slurm_strerror(rc));
+ 			thread_state = DSH_DONE;
+ 			ret_data_info->err = thread_state;
+ 			lock_slurmctld(job_write_lock);
+-			job_complete(job_id, slurm_conf.slurm_user_id,
+-			             false, false, _wif_status());
++			/* --het-batch=each: not for a superseded launch */
++			if (!het_batch_launch_fail_ignore(
++				    job_id, ret_data_info->node_name,
++				    launch_msg_ptr->restart_cnt, false)) {
++				info("Killing non-startable batch JobId=%u: %s",
++				     job_id, slurm_strerror(rc));
++				job_complete(job_id, slurm_conf.slurm_user_id,
++					     false, false, _wif_status());
++			}
+ 			unlock_slurmctld(job_write_lock);
+ 			continue;
+ 		} else if ((msg_type == RESPONSE_RESOURCE_ALLOCATION) &&
+@@ -2301,6 +2341,29 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
+ 		return -1;	/* job cancelled while waiting */
+ 	}
+ 
++	/*
++	 * --het-batch=each: the component was requeued, or lost this node and
++	 * had its batch script relaunched on another one, while the launch
++	 * waited
++	 */
++	if (job_ptr->bit_flags & HETJOB_BATCH_EACH) {
++		char *launch_host = hostlist_deranged_string_xmalloc(
++			agent_arg_ptr->hostlist);
++		bool superseded = het_batch_launch_superseded(
++			job_ptr, launch_host, launch_msg_ptr->restart_cnt);
++
++		if (superseded)
++			info("agent(batch_launch): removed superseded request for %pJ to %s (restart count %u), its batch host is now %s (restart count %u, HetBatchRestart=%u)",
++			     job_ptr, launch_host, launch_msg_ptr->restart_cnt,
++			     job_ptr->batch_host ? job_ptr->batch_host : "(none)",
++			     job_ptr->restart_cnt, job_ptr->het_batch_restart);
++		xfree(launch_host);
++		if (superseded)
++			return -1;
++		/* Still to be sent: the script is not missing yet */
++		het_batch_launch_pending(job_ptr);
++	}
++
+ 	if (job_ptr->details && job_ptr->details->prolog_running) {
+ 		debug2("%s: JobId=%u still waiting on %u prologs",
+ 		       __func__, job_ptr->job_id,
+@@ -2364,6 +2427,22 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
+ 		queued_req_ptr->last_attempt  = now;
+ 	} else if (difftime(now, queued_req_ptr->first_attempt) >=
+ 		   slurm_conf.resume_timeout) {
++		/*
++		 * --het-batch=each: a relaunch (not superseded, see above)
++		 * waits for its batch host until the node responds (then it is
++		 * sent) or is marked DOWN (then the script is relaunched on the
++		 * next node, which supersedes this request). Dropped here, it
++		 * would leave the component without a batch script if the node
++		 * came back without being marked DOWN.
++		 */
++		if (het_job_batch_each(job_ptr) &&
++		    job_ptr->het_batch_restart) {
++			debug("%s: relaunch %u of the batch script of %pJ still waits for %s to respond",
++			      __func__, job_ptr->het_batch_restart, job_ptr,
++			      job_ptr->batch_host);
++			queued_req_ptr->last_attempt = now;
++			return 1;
++		}
+ 		/* Nodes will get marked DOWN and job requeued, if possible */
+ 		error("agent waited too long for nodes to respond, abort launch of JobId=%u",
+ 		      job_ptr->job_id);
+diff --git a/src/slurmctld/fed_mgr.c b/src/slurmctld/fed_mgr.c
+index d496ba0..7aa9ea0 100644
+--- a/src/slurmctld/fed_mgr.c
++++ b/src/slurmctld/fed_mgr.c
+@@ -3335,16 +3335,17 @@ extern int fed_mgr_state_save(void)
+ 	START_TIMER;
+ 
+ 	/* write header: version, time */
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	lock_slurmctld(fed_read_lock);
+-	slurmdb_pack_federation_rec(fed_mgr_fed_rec, SLURM_PROTOCOL_VERSION,
++	slurmdb_pack_federation_rec(fed_mgr_fed_rec,
++				    SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				    buffer);
+ 	unlock_slurmctld(fed_read_lock);
+ 
+-	_dump_fed_job_list(buffer, SLURM_PROTOCOL_VERSION);
+-	_dump_remote_dep_job_list(buffer, SLURM_PROTOCOL_VERSION);
++	_dump_fed_job_list(buffer, SLURM_STOCK_STATE_PROTOCOL_VERSION);
++	_dump_remote_dep_job_list(buffer, SLURM_STOCK_STATE_PROTOCOL_VERSION);
+ 
+ 	error_code = save_buf_to_state(FED_MGR_STATE_FILE, buffer, NULL);
+ 
+diff --git a/src/slurmctld/job_mgr.c b/src/slurmctld/job_mgr.c
+index f5dcf46..01c0484 100644
+--- a/src/slurmctld/job_mgr.c
++++ b/src/slurmctld/job_mgr.c
+@@ -179,6 +179,11 @@ typedef struct {
+ 	kill_jobs_msg_t *kill_msg;
+ 	time_t now;
+ 	list_t *other_job_list; /* list of job_record_t */
++	list_t *het_comp_list; /* --het-batch=each leaders selected as
++				* "<id>+0": signal that component only */
++	list_t *het_each_leaders; /* uint32_t * IDs of matched leaders of
++				   * --het-batch=each hetjobs */
++	bool comp_only; /* signalling het_comp_list */
+ 	list_t *responses; /* list of kill_jobs_resp_job_t */
+ } signal_jobs_args_t;
+ 
+@@ -259,11 +264,13 @@ typedef struct {
+ } foreach_kill_job_by_t;
+ 
+ typedef struct {
++	int done_cnt;		/* --het-batch=each: components already done */
+ 	uint16_t flags;
+ 	job_record_t *het_job_leader;
+ 	bool preempt;
+ 	int rc;
+ 	uint16_t signal;
++	int signal_cnt;		/* records signalled successfully */
+ 	uid_t uid;
+ } foreach_kill_hetjob_t;
+ 
+@@ -2525,6 +2532,280 @@ extern job_record_t *find_het_job_record(uint32_t job_id,
+ 			       &search_job_rec);
+ }
+ 
++/*
++ * Hetjobs submitted with sbatch --het-batch=each (HETJOB_BATCH_EACH on every
++ * component record):
++ *
++ * Every component runs its own batch script on its first node and ends on its
++ * own (batch script exit, NODE_FAIL, scancel <id>+N). The hetjob itself - the
++ * leader record, het_job_list and the component job IDs - lives until its last
++ * component ends, and scancel <leader id> still cancels every component.
++ *
++ * A component requeued alone cannot wait for resources as a member of the
++ * hetjob: the schedulers treat a pending hetjob component as part of a gang
++ * that starts together (backfill _het_job_start_*(), launch transactions,
++ * _schedule() skips hetjob components). So while it is pending it is
++ * detached: het_job_id/het_job_offset move to het_join_id/het_join_offset, it
++ * is scheduled like any other job, and select_nodes() attaches it to the
++ * hetjob again when it starts (het_job_attach()). Only components other than
++ * the leader can be requeued alone: the leader record carries the hetjob.
++ */
++extern bool het_job_batch_each(job_record_t *job_ptr)
++{
++	return (job_ptr->het_job_id &&
++		(job_ptr->bit_flags & HETJOB_BATCH_EACH));
++}
++
++static bool _het_job_is_leader(job_record_t *job_ptr)
++{
++	return (job_ptr->het_job_id &&
++		(job_ptr->het_job_id == job_ptr->job_id));
++}
++
++/*
++ * find_het_job_record() that also finds a pending job waiting to become
++ * component <het_job_id>+<offset> (detached, see _het_job_detach()). Such a
++ * job has job ID het_job_id + offset, like every component.
++ */
++static job_record_t *_find_het_comp(uint32_t het_job_id, uint32_t offset)
++{
++	job_record_t *job_ptr = find_het_job_record(het_job_id, offset);
++
++	if (!job_ptr && (job_ptr = find_job_record(het_job_id + offset)) &&
++	    ((job_ptr->het_join_id != het_job_id) ||
++	     (job_ptr->het_join_offset != offset)))
++		job_ptr = NULL;
++
++	return job_ptr;
++}
++
++/* SchedulerParameters=het_batch_each allows sbatch --het-batch=each */
++static bool _het_batch_each_enabled(void)
++{
++	static time_t sched_update = 0;
++	static bool enabled = false;
++
++	if (sched_update != slurm_conf.last_update) {
++		enabled = xstrcasestr(slurm_conf.sched_params,
++				      "het_batch_each");
++		sched_update = slurm_conf.last_update;
++	}
++
++	return enabled;
++}
++
++static int _foreach_het_id_set_add(void *x, void *arg)
++{
++	job_record_t *het_job = x;
++	hostset_t **hs = arg;
++	char tmp_str[32];
++
++	snprintf(tmp_str, sizeof(tmp_str), "%u", het_job->job_id);
++	if (*hs)
++		(void) hostset_insert(*hs, tmp_str);
++	else
++		*hs = hostset_create(tmp_str);
++
++	return 0;
++}
++
++static int _foreach_het_id_set_copy(void *x, void *arg)
++{
++	job_record_t *het_job = x;
++
++	xfree(het_job->het_job_id_set);
++	het_job->het_job_id_set = xstrdup(arg);
++
++	return 0;
++}
++
++/*
++ * Rebuild het_job_id_set on every component after het_job_list changed.
++ * After a restart read_config.c:_validate_het_jobs() rebuilds het_job_list
++ * from the leader's het_job_id_set, so it must list exactly the attached
++ * components. Same format as proc_req.c:_create_het_job_id_set().
++ */
++static void _het_job_rebuild_id_set(job_record_t *het_leader)
++{
++	hostset_t *hs = NULL;
++	char *ranged, *id_set, *end;
++
++	(void) list_for_each(het_leader->het_job_list,
++			     _foreach_het_id_set_add, &hs);
++	if (!hs)
++		return;
++	ranged = hostset_ranged_string_xmalloc(hs);
++	hostset_destroy(hs);
++
++	id_set = ranged;
++	if (id_set[0] == '[') {
++		if ((end = strchr(id_set, ']')))
++			end[0] = '\0';
++		id_set++;
++	}
++	(void) list_for_each(het_leader->het_job_list,
++			     _foreach_het_id_set_copy, id_set);
++	xfree(ranged);
++}
++
++static int _sort_het_comp_by_offset(void *x, void *y)
++{
++	job_record_t *job_ptr1 = *(job_record_t **) x;
++	job_record_t *job_ptr2 = *(job_record_t **) y;
++
++	if (job_ptr1->het_job_offset < job_ptr2->het_job_offset)
++		return -1;
++	if (job_ptr1->het_job_offset > job_ptr2->het_job_offset)
++		return 1;
++	return 0;
++}
++
++static int _foreach_het_comp_pending(void *x, void *arg)
++{
++	job_record_t *het_job = x;
++
++	return ((het_job != arg) && IS_JOB_PENDING(het_job)) ? 1 : 0;
++}
++
++static int _foreach_het_comp_active(void *x, void *arg)
++{
++	job_record_t *het_job = x;
++
++	return (IS_JOB_RUNNING(het_job) || IS_JOB_SUSPENDED(het_job)) ? 1 : 0;
++}
++
++/*
++ * Detach a component of a --het-batch=each hetjob that was requeued alone, so
++ * it is scheduled like an ordinary job until het_job_attach() puts it back.
++ * A component that went back to pending with other components of its hetjob
++ * (the whole hetjob requeued, or a hetjob launch transaction rolled back) is
++ * part of that gang and stays attached.
++ */
++static void _het_job_detach(job_record_t *job_ptr)
++{
++	job_record_t *het_leader;
++
++	if (!het_job_batch_each(job_ptr) || _het_job_is_leader(job_ptr) ||
++	    !IS_JOB_PENDING(job_ptr))
++		return;
++
++	het_leader = find_job_record(job_ptr->het_job_id);
++	if (het_leader && het_leader->het_job_list &&
++	    list_find_first(het_leader->het_job_list,
++			    _foreach_het_comp_pending, job_ptr))
++		return;
++
++	info("%s: %pJ requeued alone, detached from hetjob %u until it starts again as component +%u",
++	     __func__, job_ptr, job_ptr->het_job_id, job_ptr->het_job_offset);
++
++	job_ptr->het_join_id = job_ptr->het_job_id;
++	job_ptr->het_join_offset = job_ptr->het_job_offset;
++	job_ptr->het_job_id = 0;
++	job_ptr->het_job_offset = 0;
++	job_ptr->het_details = NULL;	/* owned by the leader */
++	xfree(job_ptr->het_job_id_set);
++
++	if (het_leader && het_leader->het_job_list) {
++		(void) list_delete_ptr(het_leader->het_job_list, job_ptr);
++		_het_job_rebuild_id_set(het_leader);
++	} else {
++		error("%s: hetjob leader %u of %pJ not found",
++		      __func__, job_ptr->het_join_id, job_ptr);
++	}
++	last_job_update = time(NULL);
++}
++
++extern int het_job_join_test(job_record_t *job_ptr)
++{
++	job_record_t *het_leader;
++
++	xassert(job_ptr->het_join_id);
++
++	het_leader = find_job_record(job_ptr->het_join_id);
++	if (!het_leader || !het_leader->het_job_list ||
++	    !_het_job_is_leader(het_leader) ||
++	    !het_job_batch_each(het_leader))
++		return ESLURM_INVALID_JOB_ID;
++
++	/*
++	 * The hetjob is being (re)started as a gang (all of it was requeued):
++	 * attaching a running component to a pending gang would break the
++	 * all-components-start-together assumption of the hetjob launch code.
++	 */
++	if (list_find_first(het_leader->het_job_list,
++			    _foreach_het_comp_pending, NULL))
++		return ESLURM_JOB_PENDING;
++
++	/* Every attached component has ended: nothing left to join */
++	if (!list_find_first(het_leader->het_job_list,
++			     _foreach_het_comp_active, NULL))
++		return ESLURM_INVALID_JOB_ID;
++
++	return SLURM_SUCCESS;
++}
++
++extern void het_job_attach(job_record_t *job_ptr)
++{
++	job_record_t *het_leader;
++
++	if (!job_ptr->het_join_id)
++		return;
++
++	het_leader = find_job_record(job_ptr->het_join_id);
++	if (!het_leader || !het_leader->het_job_list) {
++		error("%s: hetjob %u of %pJ not found, running it as an ordinary job",
++		      __func__, job_ptr->het_join_id, job_ptr);
++		job_ptr->het_join_id = 0;
++		job_ptr->het_join_offset = 0;
++		return;
++	}
++
++	job_ptr->het_job_id = het_leader->het_job_id;
++	job_ptr->het_job_offset = job_ptr->het_join_offset;
++	job_ptr->het_details = het_leader->het_details;
++	job_ptr->bit_flags |= (het_leader->bit_flags & HETJOB_BATCH_EACH);
++	job_ptr->het_join_id = 0;
++	job_ptr->het_join_offset = 0;
++
++	list_append(het_leader->het_job_list, job_ptr);
++	list_sort(het_leader->het_job_list, _sort_het_comp_by_offset);
++	_het_job_rebuild_id_set(het_leader);
++
++	info("%s: %pJ attached to hetjob %u as component +%u",
++	     __func__, job_ptr, job_ptr->het_job_id, job_ptr->het_job_offset);
++	last_job_update = time(NULL);
++}
++
++/*
++ * A pending job that would join a hetjob that has ended can never start.
++ * Cancel it, the same way _kill_dependent() cancels a job whose dependency
++ * can never be satisfied.
++ */
++static void _kill_het_joiner(job_record_t *job_ptr)
++{
++	time_t now = time(NULL);
++
++	info("%s: hetjob %u has ended, cancelling %pJ",
++	     __func__, job_ptr->het_join_id, job_ptr);
++	job_state_set(job_ptr, JOB_CANCELLED);
++	xfree(job_ptr->state_desc);
++	xstrfmtcat(job_ptr->state_desc, "hetjob %u ended before this job started",
++		   job_ptr->het_join_id);
++	job_ptr->start_time = now;
++	job_ptr->end_time = now;
++	job_completion_logger(job_ptr, false);
++	last_job_update = now;
++}
++
++static int _find_het_joiner(void *x, void *key)
++{
++	job_record_t *job_ptr = x;
++	uint32_t het_job_id = *(uint32_t *) key;
++
++	return ((job_ptr->het_join_id == het_job_id) &&
++		!IS_JOB_FINISHED(job_ptr));
++}
++
+ /*
+  * find_job_record - return a pointer to the job record with the given job_id
+  * IN job_id - requested job's id
+@@ -2943,6 +3224,8 @@ static int _foreach_find_het_whole_fail(void *x, void *arg)
+ 
+ 	if (!job_ptr->het_job_list || (job_ptr->het_job_id != job_ptr->job_id))
+ 		return 0;	/* not a hetjob leader */
++	if (het_job_batch_each(job_ptr))
++		return 0;	/* every component has its own batch script */
+ 	if (!IS_JOB_RUNNING(job_ptr) && !IS_JOB_SUSPENDED(job_ptr))
+ 		return 0;
+ 	if (!_het_leader_lost(job_ptr, foreach_kill_job_by->node_ptr))
+@@ -2967,6 +3250,8 @@ static bool _het_comp_fails_alone(job_record_t *job_ptr,
+ {
+ 	if (!job_ptr->het_job_id)
+ 		return false;
++	if (het_job_batch_each(job_ptr))
++		return true;	/* components are independent (--het-batch=each) */
+ 	if (!foreach_kill_job_by->het_comp_node_fail)
+ 		return false;
+ 	/* The leader running the only batch script is lost with the node */
+@@ -2982,11 +3267,202 @@ static bool _het_comp_fails_alone(job_record_t *job_ptr,
+  * its own batch script. With the stock batch semantics only the leader does:
+  * relaunching a lone non-leader component would start the leader's script a
+  * second time (launch_job() -> _het_job_ready()), so such a component ends
+- * with NODE_FAIL instead.
++ * with NODE_FAIL instead. With --het-batch=each every component other than
++ * the leader can be requeued alone (it is detached until it starts again,
++ * see _het_job_detach()); the leader record carries the hetjob, so it ends.
+  */
+ static bool _het_comp_can_requeue(job_record_t *job_ptr, bool fails_alone)
+ {
+-	return !fails_alone;
++	if (!fails_alone)
++		return true;
++	return (het_job_batch_each(job_ptr) && !_het_job_is_leader(job_ptr));
++}
++
++/*
++ * --het-batch=each: true if the component loses the node that runs its batch
++ * script. A component that keeps running without that node (--no-kill, other
++ * nodes left) gets its script relaunched on one of them (het_batch_relaunch()),
++ * instead of running on with no batch script until it is cancelled, as stock
++ * Slurm leaves a --no-kill batch job whose batch host died.
++ */
++static bool _het_batch_host_lost(job_record_t *job_ptr,
++				 node_record_t *node_ptr)
++{
++	return (het_job_batch_each(job_ptr) && job_ptr->batch_flag &&
++		job_ptr->batch_host &&
++		!xstrcmp(job_ptr->batch_host, node_ptr->name));
++}
++
++/*
++ * Whether het_batch_relaunch() can relaunch the batch script of a component
++ * that lost its batch host. If not, the component does not keep running
++ * without a batch script: it takes the node failure like a component without
++ * --no-kill. Gated by SchedulerParameters=het_batch_each, like the submission
++ * of such hetjobs.
++ */
++static bool _het_batch_relaunch_ok(job_record_t *job_ptr, bool suspended)
++{
++	buf_t *script;
++
++	if (suspended || !_het_batch_each_enabled())
++		return false;
++	/*
++	 * Without its script the relaunch would fail after the node was
++	 * excised, and the component would end NODE_FAIL there. Checked
++	 * first, so that the component takes the node failure as a whole
++	 * instead (a --requeue component other than the leader is requeued).
++	 */
++	if (!(script = get_job_script(job_ptr))) {
++		error("%s: %pJ lost its batch host but its batch script cannot be loaded",
++		      __func__, job_ptr);
++		return false;
++	}
++	FREE_NULL_BUFFER(script);
++	return true;
++}
++
++/*
++ * The batch step of a component whose batch host failed ended with the node:
++ * kill what may be left of it (a node set DOWN by scontrol can still run it)
++ * and complete it as killed by the node failure. kill_step_on_node() must not
++ * see it: _step_partial_comp() refuses batch steps ("This should never
++ * happen").
++ */
++static void _het_batch_step_lost(job_record_t *job_ptr,
++				 node_record_t *node_ptr)
++{
++	slurm_step_id_t step_id = {
++		.job_id = job_ptr->job_id,
++		.step_id = SLURM_BATCH_SCRIPT,
++		.step_het_comp = NO_VAL,
++	};
++	step_record_t *step_ptr = find_step_record(job_ptr, &step_id);
++
++	if (!step_ptr)
++		return;	/* not launched yet */
++	info("%s: %pS ended with its batch host %s",
++	     __func__, step_ptr, node_ptr->name);
++	signal_step_tasks(step_ptr, SIGKILL, REQUEST_TERMINATE_TASKS);
++	step_ptr->exit_code = SIGKILL;
++	step_ptr->state = JOB_NODE_FAIL | JOB_COMPLETING;
++	jobacct_storage_g_step_complete(acct_db_conn, step_ptr);
++	delete_step_record(job_ptr, step_ptr);
++}
++
++/*
++ * het_batch_launch_superseded - see slurmctld.h
++ */
++extern bool het_batch_launch_superseded(job_record_t *job_ptr,
++					const char *node_name,
++					uint16_t restart_cnt)
++{
++	/* A component, attached or detached (requeued alone, pending) */
++	if (!job_ptr || !job_ptr->batch_flag ||
++	    !(job_ptr->bit_flags & HETJOB_BATCH_EACH))
++		return false;
++	/* Sent before the component was requeued (and maybe started again) */
++	if (restart_cnt != job_ptr->restart_cnt)
++		return true;
++	/* Sent to a batch host the component lost since (relaunched) */
++	return (node_name && xstrcmp(job_ptr->batch_host, node_name));
++}
++
++/*
++ * het_batch_launch_fail_ignore - see slurmctld.h
++ */
++extern bool het_batch_launch_fail_ignore(uint32_t job_id,
++					 const char *node_name,
++					 uint16_t restart_cnt, bool no_resp)
++{
++	job_record_t *job_ptr;
++
++	xassert(verify_lock(JOB_LOCK, WRITE_LOCK));
++
++	if (!(job_ptr = find_job_record(job_id)) ||
++	    !(job_ptr->bit_flags & HETJOB_BATCH_EACH))
++		return false;
++	if (het_batch_launch_superseded(job_ptr, node_name, restart_cnt)) {
++		info("%s: ignoring the failed batch launch of %pJ to %s (restart count %u): superseded, its batch host is now %s (restart count %u, HetBatchRestart=%u)",
++		     __func__, job_ptr, node_name ? node_name : "(unknown)",
++		     restart_cnt,
++		     job_ptr->batch_host ? job_ptr->batch_host : "(none)",
++		     job_ptr->restart_cnt, job_ptr->het_batch_restart);
++		return true;
++	}
++	/*
++	 * No response, and the script was relaunched since the first launch:
++	 * the launch that failed is either the current relaunch or one it
++	 * superseded (node_name not known). Either way the component keeps
++	 * running: once its batch host is marked DOWN the script is
++	 * relaunched on the next node (kill_running_job_by_node_ptr()). The
++	 * launch is not sent again: if it did reach slurmd and only the
++	 * reply was lost, slurmd would refuse a second batch step and
++	 * requeue or kill the component (req.c:_rpc_batch_job()).
++	 */
++	if (no_resp && job_ptr->het_batch_restart &&
++	    IS_JOB_RUNNING(job_ptr) && !IS_JOB_COMPLETING(job_ptr)) {
++		info("%s: relaunch %u of the batch script of %pJ got no response from %s; %pJ keeps running, and its script is relaunched on the next node once %s is marked DOWN",
++		     __func__, job_ptr->het_batch_restart, job_ptr,
++		     node_name ? node_name : "its batch host", job_ptr,
++		     job_ptr->batch_host ? job_ptr->batch_host : "(none)");
++		return true;
++	}
++	return false;
++}
++
++static step_record_t *_het_batch_step(job_record_t *job_ptr)
++{
++	slurm_step_id_t step_id = {
++		.job_id = job_ptr->job_id,
++		.step_id = SLURM_BATCH_SCRIPT,
++		.step_het_comp = NO_VAL,
++	};
++
++	return find_step_record(job_ptr, &step_id);
++}
++
++/*
++ * het_batch_launch_pending - see slurmctld.h
++ */
++extern void het_batch_launch_pending(job_record_t *job_ptr)
++{
++	step_record_t *step_ptr;
++
++	xassert(verify_lock(JOB_LOCK, WRITE_LOCK));
++
++	if (!job_ptr || !(job_ptr->bit_flags & HETJOB_BATCH_EACH) ||
++	    !(step_ptr = _het_batch_step(job_ptr)))
++		return;
++	step_ptr->time_last_active = time(NULL);
++}
++
++/*
++ * --het-batch=each: true if the component's batch script should run on its
++ * batch host, which is registering now, but that node has not reported the
++ * batch step since startup_time (_purge_missing_jobs()).
++ *
++ * The job's time_last_active, which the stock test uses, says nothing here:
++ * every registration of the job's first node refreshes it for any step of the
++ * job (validate_jobs_on_node()), and after a relaunch the new batch host is
++ * the first node left and runs the component's agent steps. A relaunch that
++ * never arrived (the agent's queue is lost when slurmctld restarts, and
++ * `scontrol reconfigure` restarts it in 25.05; or a launch that got no
++ * response from a batch host that stays up) then left the component RUNNING
++ * without a script, for good. The batch step's own time_last_active is
++ * refreshed when its batch host reports it and while the agent still holds
++ * its launch (het_batch_launch_pending()). Its start time is the launch (or
++ * relaunch) time, which gives the script BatchStartTimeout to start.
++ */
++static bool _het_batch_script_missing(job_record_t *job_ptr,
++				      time_t startup_time)
++{
++	step_record_t *step_ptr = _het_batch_step(job_ptr);
++
++	if (!step_ptr)
++		return ((job_ptr->time_last_active < startup_time) &&
++			(job_ptr->start_time < startup_time));
++	return ((step_ptr->time_last_active < startup_time) &&
++		(step_ptr->start_time < startup_time));
+ }
+ 
+ static bool _het_job_on_node(job_record_t *job_ptr, int node_inx,
+@@ -3085,8 +3561,20 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 			      node_ptr->name, job_ptr);
+ 		}
+ 	} else if (IS_JOB_RUNNING(job_ptr) || suspended) {
++		bool survives = !het_whole && _job_survives_node_loss(job_ptr);
++		bool relaunch = false;
++
++		/*
++		 * --het-batch=each: a component that keeps running without the
++		 * node that ran its batch script gets the script relaunched on
++		 * another of its nodes, or it does not keep running.
++		 */
++		if (survives && _het_batch_host_lost(job_ptr, node_ptr))
++			survives = relaunch =
++				_het_batch_relaunch_ok(job_ptr, suspended);
++
+ 		foreach_kill_job_by->kill_job_cnt++;
+-		if (!het_whole && _job_survives_node_loss(job_ptr)) {
++		if (survives) {
+ 			bitstr_t *orig_job_node_bitmap;
+ 
+ 			/* keep job running on remaining nodes */
+@@ -3094,6 +3582,8 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 			error("Removing failed node %s from %pJ",
+ 			      node_ptr->name, job_ptr);
+ 			job_pre_resize_acctg(job_ptr);
++			if (relaunch)
++				_het_batch_step_lost(job_ptr, node_ptr);
+ 			kill_step_on_node(job_ptr, node_ptr, true);
+ 			orig_job_node_bitmap =
+ 				bit_copy(job_resrcs_ptr->node_bitmap);
+@@ -3109,6 +3599,29 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 				&job_ptr->gres_detail_str,
+ 				&job_ptr->gres_used);
+ 			job_post_resize_acctg(job_ptr);
++			if (relaunch && het_batch_relaunch(job_ptr)) {
++				/*
++				 * As the last branch below, not suspended.
++				 * het_batch_relaunch() launched nothing and
++				 * left no batch step, and srun_node_fail()
++				 * already ran above for this node.
++				 */
++				error("%s: cannot relaunch the batch script of %pJ, killing it",
++				      __func__, job_ptr);
++				job_state_set(job_ptr,
++					      (JOB_NODE_FAIL | JOB_COMPLETING));
++				xfree(job_ptr->failed_node);
++				job_ptr->failed_node = xstrdup(node_ptr->name);
++				build_cg_bitmap(job_ptr);
++				job_ptr->state_reason = FAIL_DOWN_NODE;
++				xfree(job_ptr->state_desc);
++				job_ptr->state_desc =
++					xstrdup("batch script relaunch failed");
++				job_ptr->end_time = foreach_kill_job_by->now;
++				job_ptr->exit_code = 1;
++				job_completion_logger(job_ptr, false);
++				deallocate_nodes(job_ptr, false, false, false);
++			}
+ 		} else if (job_ptr->batch_flag &&
+ 			   _het_comp_can_requeue(job_ptr, het_alone) &&
+ 			   ((job_ptr->details &&
+@@ -3160,6 +3673,8 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
+ 			if (!job_ptr->node_bitmap_cg ||
+ 			    bit_ffs(job_ptr->node_bitmap_cg) == -1)
+ 				batch_requeue_fini(job_ptr);
++			if (het_alone)
++				_het_job_detach(job_ptr);
+ 		} else {
+ 			info("Killing %pJ on failed node %s",
+ 			     job_ptr, node_ptr->name);
+@@ -4781,7 +5296,29 @@ static bool _signal_job_matches_filter(job_record_t *job_ptr,
+ 	char *filter_err_msg = NULL;
+ 	kill_jobs_msg_t *kill_msg = signal_args->kill_msg;
+ 
+-	if (IS_JOB_FINISHED(job_ptr)) {
++	/*
++	 * --het-batch=each: components that joined (or rejoined) the hetjob
++	 * after it was submitted are not next to their leader in job_list,
++	 * and jobs waiting to (re)join it are ordinary jobs. If the leader
++	 * matched, het_job_signal() reaches them (or they already ended); do
++	 * not signal them twice or report them.
++	 */
++	if (signal_args->het_each_leaders &&
++	    ((job_ptr->het_job_offset &&
++	      list_find_first(signal_args->het_each_leaders, _find_het_job_id,
++			      &job_ptr->het_job_id)) ||
++	     (job_ptr->het_join_id &&
++	      list_find_first(signal_args->het_each_leaders, _find_het_job_id,
++			      &job_ptr->het_join_id))))
++		return false;
++
++	/*
++	 * The leader of a --het-batch=each hetjob may have ended while other
++	 * components still run or are pending (detached or joining): keep it,
++	 * het_job_signal() reaches all of them through it.
++	 */
++	if (IS_JOB_FINISHED(job_ptr) &&
++	    !(job_ptr->het_job_list && het_job_batch_each(job_ptr))) {
+ 		error_code = ESLURM_ALREADY_DONE;
+ 		matches_filter = false;
+ 		goto fini;
+@@ -4996,6 +5533,22 @@ static bool _signal_job_matches_filter(job_record_t *job_ptr,
+ 			return false;
+ 		}
+ 
++		/*
++		 * --het-batch=each: components are signalled alone, whatever
++		 * whole_hetjob says, except while pending as part of the
++		 * hetjob's gang start. Unlike the stock checks below, this
++		 * one does keep the component from being signalled.
++		 */
++		if (het_job_batch_each(job_ptr)) {
++			if (IS_JOB_PENDING(job_ptr)) {
++				error_code = ESLURM_NOT_WHOLE_HET_JOB;
++				matches_filter = false;
++				if (signal_args->filter_specific_job_ids)
++					filter_err_msg = xstrdup("Het job component cannot be signalled while pending");
++			}
++			goto fini;
++		}
++
+ 		/*
+ 		 * Het job components may not be signalled individually if they
+ 		 * are pending or if whole_hetjob is set.
+@@ -5022,6 +5575,15 @@ fini:
+ 		/* Track most recent het leader. */
+ 		if (job_ptr->het_job_id && !job_ptr->het_job_offset)
+ 			signal_args->het_leader = job_ptr;
++		if (job_ptr->het_job_list && het_job_batch_each(job_ptr)) {
++			uint32_t *id = xmalloc(sizeof(*id));
++
++			*id = job_ptr->het_job_id;
++			if (!signal_args->het_each_leaders)
++				signal_args->het_each_leaders =
++					list_create(xfree_ptr);
++			list_append(signal_args->het_each_leaders, id);
++		}
+ 	}
+ 
+ 	xfree(filter_err_msg);
+@@ -5115,7 +5677,30 @@ static void _apply_signal_jobs_filter(job_record_t *job_ptr,
+ 		list_append(signal_args->pending_array_task_list, atf);
+ 	} else if (job_ptr->array_recs)
+ 		list_append(signal_args->array_leader_list, job_ptr);
+-	else
++	else if (filter_id && (filter_id->het_job_offset == 0) &&
++		 job_ptr->het_job_list && het_job_batch_each(job_ptr)) {
++		/*
++		 * "<id>+0" of a --het-batch=each hetjob is the leader's own
++		 * component, "<id>" alone is the whole hetjob. So the leader
++		 * does not stand for the other components here. While it is
++		 * pending, the hetjob is pending as a gang and its components
++		 * cannot be signalled alone (as in job_str_signal()).
++		 */
++		signal_args->het_leader = NULL;
++		if (signal_args->het_each_leaders)
++			(void) list_delete_first(signal_args->het_each_leaders,
++						 _find_het_job_id,
++						 &job_ptr->het_job_id);
++		if (IS_JOB_PENDING(job_ptr)) {
++			_add_signal_job_resp(signal_args, NULL,
++					     ESLURM_NOT_WHOLE_HET_JOB, NULL,
++					     filter_id, job_ptr->job_id);
++			return;
++		}
++		if (!signal_args->het_comp_list)
++			signal_args->het_comp_list = list_create(NULL);
++		list_append(signal_args->het_comp_list, job_ptr);
++	} else
+ 		list_append(signal_args->other_job_list, job_ptr);
+ }
+ 
+@@ -5136,7 +5721,7 @@ static int _foreach_signal_job(void *x, void *arg)
+ 	signal_jobs_args_t *signal_args = arg;
+ 	kill_jobs_msg_t *kill_msg = signal_args->kill_msg;
+ 
+-	if (job_ptr->het_job_list)
++	if (job_ptr->het_job_list && !signal_args->comp_only)
+ 		error_code = het_job_signal(job_ptr, kill_msg->signal,
+ 					    kill_msg->flags,
+ 					    signal_args->auth_uid, 0);
+@@ -5523,13 +6108,45 @@ static int foreach_het_job_signal(void *x, void *arg)
+ 				     foreach_kill_hetjob->flags,
+ 				     foreach_kill_hetjob->uid,
+ 				     foreach_kill_hetjob->preempt);
+-		if (rc1 != SLURM_SUCCESS)
++		if (rc1 == SLURM_SUCCESS)
++			foreach_kill_hetjob->signal_cnt++;
++		else if ((rc1 == ESLURM_ALREADY_DONE) &&
++			 het_job_batch_each(het_job))
++			foreach_kill_hetjob->done_cnt++;
++		else
+ 			foreach_kill_hetjob->rc = rc1;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/*
++ * --het-batch=each: pending jobs detached from the hetjob (a component
++ * requeued alone, or a job joining it) belong to the hetjob too, so cancelling
++ * the hetjob cancels them.
++ */
++static int _foreach_het_joiner_cancel(void *x, void *arg)
++{
++	job_record_t *job_ptr = x;
++	foreach_kill_hetjob_t *foreach_kill_hetjob = arg;
++	int rc1;
++
++	if ((job_ptr->het_join_id !=
++	     foreach_kill_hetjob->het_job_leader->job_id) ||
++	    !IS_JOB_PENDING(job_ptr))
++		return 0;
++
++	rc1 = job_signal(job_ptr, SIGKILL, foreach_kill_hetjob->flags,
++			 foreach_kill_hetjob->uid,
++			 foreach_kill_hetjob->preempt);
++	if (rc1 == SLURM_SUCCESS)
++		foreach_kill_hetjob->signal_cnt++;
++	else
++		foreach_kill_hetjob->rc = rc1;
++
++	return 0;
++}
++
+ /* Signal all components of a hetjob */
+ extern int het_job_signal(job_record_t *het_job_leader, uint16_t signal,
+ 			  uint16_t flags, uid_t uid, bool preempt)
+@@ -5552,6 +6169,21 @@ extern int het_job_signal(job_record_t *het_job_leader, uint16_t signal,
+ 			     foreach_het_job_signal,
+ 			     &foreach_kill_hetjob);
+ 
++	if (het_job_batch_each(het_job_leader)) {
++		if (signal == SIGKILL)
++			(void) list_for_each(job_list,
++					     _foreach_het_joiner_cancel,
++					     &foreach_kill_hetjob);
++		/*
++		 * Components end on their own: report ESLURM_ALREADY_DONE
++		 * only if every one of them had already ended.
++		 */
++		if ((foreach_kill_hetjob.rc == SLURM_SUCCESS) &&
++		    foreach_kill_hetjob.done_cnt &&
++		    !foreach_kill_hetjob.signal_cnt)
++			foreach_kill_hetjob.rc = ESLURM_ALREADY_DONE;
++	}
++
+ 	return foreach_kill_hetjob.rc;
+ }
+ 
+@@ -5747,7 +6379,7 @@ extern int job_str_signal(char *job_id_str, uint16_t signal, uint16_t flags,
+ 			info("%s(2): invalid JobId=%s", __func__, job_id_str);
+ 			return ESLURM_INVALID_JOB_ID;
+ 		}
+-		job_ptr = find_het_job_record(job_id, (uint32_t) long_id);
++		job_ptr = _find_het_comp(job_id, (uint32_t) long_id);
+ 		if (!job_ptr)
+ 			return ESLURM_INVALID_JOB_ID;
+ 		if ((job_ptr->user_id != uid) && !validate_operator(uid) &&
+@@ -5758,9 +6390,26 @@ extern int job_str_signal(char *job_id_str, uint16_t signal, uint16_t flags,
+ 			return ESLURM_ACCESS_DENIED;
+ 		}
+ 
++		/* Waits detached to (re)join the hetjob: an ordinary job */
++		if (job_ptr->het_join_id)
++			return job_signal(job_ptr, signal, flags, uid, preempt);
++
+ 		if (!job_ptr->het_job_id)
+ 			return ESLURM_NOT_HET_JOB;
+ 
++		/*
++		 * --het-batch=each: components end on their own, the leader's
++		 * included, so "<id>+N" is that component only, "<id>+0"
++		 * included and whatever whole_hetjob says. A component that
++		 * is pending is part of the hetjob's gang start (not started
++		 * yet, or requeued as a whole) and cannot be signalled alone.
++		 */
++		if (het_job_batch_each(job_ptr)) {
++			if (IS_JOB_PENDING(job_ptr))
++				return ESLURM_NOT_WHOLE_HET_JOB;
++			return job_signal(job_ptr, signal, flags, uid, preempt);
++		}
++
+ 		if (!job_ptr->het_job_offset)
+ 			/*
+ 			 * HetJob leader. Attempt to signal all components no
+@@ -5815,7 +6464,8 @@ extern int job_str_signal(char *job_id_str, uint16_t signal, uint16_t flags,
+ 			return het_job_signal(job_ptr, signal, flags, uid,
+ 					      preempt);
+ 		}
+-		if (job_ptr && job_ptr->het_job_id && _get_whole_hetjob()) {
++		if (job_ptr && job_ptr->het_job_id && _get_whole_hetjob() &&
++		    !het_job_batch_each(job_ptr)) {
+ 			job_record_t *het_job_leader;
+ 			het_job_leader = find_job_record(job_ptr->het_job_id);
+ 			if (het_job_leader && het_job_leader->het_job_list) {
+@@ -6075,6 +6725,7 @@ extern int job_mgr_signal_jobs(kill_jobs_msg_t *kill_msg, uid_t auth_uid,
+ 	 * so it cannot accidentally be used later.
+ 	 */
+ 	signal_args.het_leader = NULL;
++	FREE_NULL_LIST(signal_args.het_each_leaders);
+ 	assoc_mgr_unlock(&assoc_lock);
+ 
+ 	list_for_each(signal_args.array_leader_list, _foreach_signal_job,
+@@ -6086,6 +6737,13 @@ extern int job_mgr_signal_jobs(kill_jobs_msg_t *kill_msg, uid_t auth_uid,
+ 	}
+ 	list_for_each(signal_args.other_job_list, _foreach_signal_job,
+ 		      &signal_args);
++	if (signal_args.het_comp_list) {
++		signal_args.comp_only = true;
++		list_for_each(signal_args.het_comp_list, _foreach_signal_job,
++			      &signal_args);
++		signal_args.comp_only = false;
++		FREE_NULL_LIST(signal_args.het_comp_list);
++	}
+ 
+ 	_build_kill_jobs_resp_msg(&signal_args, resp_msg_p);
+ 
+@@ -6480,7 +7138,7 @@ extern int job_complete(uint32_t job_id, uid_t uid, bool requeue,
+ 		return ESLURM_USER_ID_MISSING;
+ 	}
+ 
+-	if (job_ptr->het_job_list) {
++	if (job_ptr->het_job_list && !het_job_batch_each(job_ptr)) {
+ 		foreach_complete_hetjob_t foreach_complete_hetjob = {
+ 			.het_job_leader = job_ptr,
+ 			.job_return_code = job_return_code,
+@@ -6495,8 +7153,24 @@ extern int job_complete(uint32_t job_id, uid_t uid, bool requeue,
+ 
+ 		rc = foreach_complete_hetjob.rc;
+ 	} else {
++		/*
++		 * With --het-batch=each the end of a component's batch script
++		 * (or its launch failure) ends that component only, the
++		 * leader included. Only components other than the leader can
++		 * be requeued alone (see _het_job_detach()).
++		 */
++		bool was_pending = IS_JOB_PENDING(job_ptr);
++
++		if (requeue && het_job_batch_each(job_ptr) &&
++		    _het_job_is_leader(job_ptr)) {
++			info("%s: %pJ leads a --het-batch=each hetjob and can not be requeued alone, ending it",
++			     __func__, job_ptr);
++			requeue = false;
++		}
+ 		rc = _job_complete(job_ptr, uid, requeue, node_fail,
+ 				   job_return_code);
++		if (requeue && (rc == SLURM_SUCCESS) && !was_pending)
++			_het_job_detach(job_ptr);
+ 	}
+ 
+ 	return rc;
+@@ -7404,6 +8078,30 @@ static int _job_create(job_desc_msg_t *job_desc, int allocate, int will_run,
+ 
+ 	user_submit_priority = job_desc->priority;
+ 
++	if (job_desc->bitflags & HETJOB_BATCH_EACH) {
++		if (!_het_batch_each_enabled()) {
++			error_code = ESLURM_NOT_SUPPORTED;
++			if (err_msg)
++				*err_msg = xstrdup("--het-batch=each is not enabled (SchedulerParameters=het_batch_each)");
++			goto cleanup_fail;
++		}
++		/*
++		 * Every component needs its own copy of the batch script
++		 * (proc_req.c stores one per component, except for a
++		 * component other than the leader with a burst buffer; it
++		 * sets the leader's flag on every component's request, so
++		 * each one is checked here). Not for salloc/srun allocations
++		 * (no script).
++		 */
++		if (!job_desc->script ||
++		    (job_desc->het_job_offset == NO_VAL)) {
++			error_code = ESLURM_NOT_SUPPORTED;
++			if (err_msg)
++				*err_msg = xstrdup("--het-batch=each needs a heterogeneous batch job (sbatch), with no burst buffer on components other than the first");
++			goto cleanup_fail;
++		}
++	}
++
+ 	/* ensure that selected nodes are in this partition */
+ 	if (job_desc->req_nodes) {
+ 		error_code = node_name2bitmap(job_desc->req_nodes, false,
+@@ -9281,7 +9979,7 @@ static void _het_job_time_limit_incr(job_record_t *job_ptr,
+ {
+ 	job_record_t *het_job_leader;
+ 
+-	if (!job_ptr->het_job_id) {
++	if (!job_ptr->het_job_id || het_job_batch_each(job_ptr)) {
+ 		_job_time_limit_incr(job_ptr, boot_job_id);
+ 		return;
+ 	}
+@@ -9385,7 +10083,7 @@ static bool _het_job_configuring_test(job_record_t *job_ptr)
+ 
+ 	if (IS_JOB_CONFIGURING(job_ptr))
+ 		return true;
+-	if (!job_ptr->het_job_id)
++	if (!job_ptr->het_job_id || het_job_batch_each(job_ptr))
+ 		return false;
+ 
+ 	het_job_leader = find_job_record(job_ptr->het_job_id);
+@@ -10217,9 +10915,9 @@ end_it:
+ 	 * record alone would leave a dangling pointer in the leader's
+ 	 * het_job_list, or free the leader's het_job_list and het_details while
+ 	 * other components still use them. This matters once components end
+-	 * on their own (het_component_node_fail, scancel <id>+N). key is NULL
+-	 * when _purge_complete_het_job() asks whether a component is old
+-	 * enough.
++	 * on their own (het_component_node_fail, scancel <id>+N,
++	 * --het-batch=each). key is NULL when _purge_complete_het_job() asks
++	 * whether a component is old enough.
+ 	 */
+ 	if (key && job_ptr->het_job_id &&
+ 	    find_job_record(job_ptr->het_job_id))
+@@ -10762,6 +11460,12 @@ void pack_job(job_record_t *dump_job_ptr, uint16_t show_flags, buf_t *buffer,
+ 		 */
+ 		_pack_pending_job_details(dump_job_ptr->details,
+ 					  buffer, protocol_version);
++
++		if (protocol_version >= SLURM_25_05_HETFT1_PROTOCOL_VERSION) {
++			pack32(dump_job_ptr->het_join_id, buffer);
++			pack32(dump_job_ptr->het_join_offset, buffer);
++			pack32(dump_job_ptr->het_batch_restart, buffer);
++		}
+ 	} else if (protocol_version >= SLURM_24_11_PROTOCOL_VERSION) {
+ 		job_record_pack_common(dump_job_ptr, false, buffer,
+ 				       protocol_version);
+@@ -11880,6 +12584,12 @@ static inline bool _purge_complete_het_job(job_record_t *het_job_leader)
+ 			    het_job_leader))
+ 		return false;
+ 
++	/* A detached component or a join is still pending: hetjob lives */
++	if (het_job_batch_each(het_job_leader) &&
++	    list_find_first(job_list, _find_het_joiner,
++			    &het_job_leader->job_id))
++		return false;
++
+ 	(void) list_for_each(het_job_leader->het_job_list,
+ 			     _foreach_set_het_job_for_purge,
+ 			     het_job_leader);
+@@ -16197,11 +16907,13 @@ static int _foreach_purge_missing_jobs(void *x, void *arg)
+ 		startup_time -= slurm_conf.resume_timeout;
+ 
+ 	if (job_ptr->batch_flag &&
+-	    !job_ptr->het_job_offset &&
+-	    (job_ptr->time_last_active < startup_time) &&
+-	    (job_ptr->start_time < startup_time) &&
++	    (!job_ptr->het_job_offset || het_job_batch_each(job_ptr)) &&
+ 	    (foreach_purge_missing_jobs->node_ptr ==
+-	     find_node_record(job_ptr->batch_host))) {
++	     find_node_record(job_ptr->batch_host)) &&
++	    (het_job_batch_each(job_ptr) ?
++	     _het_batch_script_missing(job_ptr, startup_time) :
++	     ((job_ptr->time_last_active < startup_time) &&
++	      (job_ptr->start_time < startup_time)))) {
+ 		bool requeue = false;
+ 		char *requeue_msg = "";
+ 		if (job_ptr->details && job_ptr->details->requeue) {
+@@ -16840,6 +17552,7 @@ void batch_requeue_fini(job_record_t *job_ptr)
+ 	job_ptr->total_nodes = 0;
+ 	xfree(job_ptr->alias_list);
+ 	xfree(job_ptr->batch_host);
++	job_ptr->het_batch_restart = 0;	/* a requeued job starts afresh */
+ 	free_job_resources(&job_ptr->job_resrcs);
+ 	FREE_NULL_LIST(job_ptr->license_list);
+ 	xfree(job_ptr->licenses_allocated);
+@@ -17209,7 +17922,19 @@ extern bool job_independent(job_record_t *job_ptr)
+ {
+ 	job_details_t *detail_ptr = job_ptr->details;
+ 	time_t now = time(NULL);
+-	int depend_rc;
++	int depend_rc, join_rc = SLURM_SUCCESS;
++
++	/*
++	 * A job that (re)joins a hetjob when it starts is cancelled as soon as
++	 * the hetjob has ended, also while it is held or waits for anything
++	 * else: until then it keeps the hetjob's records and reserved job IDs
++	 * (_purge_complete_het_job()).
++	 */
++	if (job_ptr->het_join_id && IS_JOB_PENDING(job_ptr) &&
++	    ((join_rc = het_job_join_test(job_ptr)) == ESLURM_INVALID_JOB_ID)) {
++		_kill_het_joiner(job_ptr);
++		return false;
++	}
+ 
+ 	if ((job_ptr->state_reason == FAIL_BURST_BUFFER_OP) ||
+ 	    (job_ptr->state_reason == FAIL_ACCOUNT) ||
+@@ -17237,6 +17962,16 @@ extern bool job_independent(job_record_t *job_ptr)
+ 		handle_invalid_dependency(job_ptr);
+ 		return false;
+ 	}
++
++	/* A job joining a hetjob waits while the hetjob is pending as a whole */
++	if (join_rc != SLURM_SUCCESS) {
++		job_ptr->state_reason = WAIT_DEPENDENCY;
++		xfree(job_ptr->state_desc);
++		xstrfmtcat(job_ptr->state_desc,
++			   "waiting for hetjob %u to start",
++			   job_ptr->het_join_id);
++		return false;
++	}
+ 	/* Job is eligible to start now */
+ 	if (job_ptr->state_reason == WAIT_DEPENDENCY) {
+ 		job_ptr->state_reason = WAIT_NO_REASON;
+@@ -18193,6 +18928,45 @@ static int _foreach_hetjob_requeue(void *x, void *arg)
+ 	return 0;
+ }
+ 
++/*
++ * --het-batch=each, whole-hetjob requeue: the refusals of _job_requeue_op()
++ * for one attached component, tested before any component changes.
++ */
++static int _foreach_hetjob_requeue_test(void *x, void *arg)
++{
++	job_record_t *het_job = x;
++	foreach_requeue_hetjob_t *requeue_hetjob = arg;
++	uint32_t flags = requeue_hetjob->flags;
++	bool force_requeue = ((flags & JOB_LAUNCH_FAILED) &&
++			      (slurm_conf.prolog_flags &
++			       PROLOG_FLAG_FORCE_REQUEUE_ON_FAIL));
++	int rc = SLURM_SUCCESS;
++
++	if ((requeue_hetjob->uid != het_job->user_id) &&
++	    !validate_operator(requeue_hetjob->uid) &&
++	    !assoc_mgr_is_user_acct_coord(acct_db_conn, requeue_hetjob->uid,
++					  het_job->account, false))
++		rc = ESLURM_ACCESS_DENIED;
++	else if (!het_job->part_ptr || !het_job->details ||
++		 (!het_job->details->requeue && !force_requeue))
++		rc = ESLURM_DISABLED;
++	else if (!het_job->batch_flag)
++		rc = ESLURM_BATCH_ONLY;
++	else if (IS_JOB_PENDING(het_job))
++		rc = ESLURM_JOB_PENDING;
++	else if ((flags & JOB_RECONFIG_FAIL) && IS_JOB_CANCELLED(het_job))
++		rc = ESLURM_DISABLED;
++
++	if (rc == SLURM_SUCCESS)
++		return 0;
++
++	info("%s: %pJ can not be requeued (%s), so hetjob %pJ is not requeued",
++	     __func__, het_job, slurm_strerror(rc),
++	     requeue_hetjob->het_leader);
++	requeue_hetjob->rc = rc;
++	return -1;
++}
++
+ /*
+  * _job_requeue - Requeue a running or pending batch job, if the specified
+  *		  job records is a hetjob leader, perform the operation on all
+@@ -18207,8 +18981,15 @@ static int _job_requeue(uid_t uid, job_record_t *job_ptr, bool preempt,
+ {
+ 	int rc = SLURM_SUCCESS;
+ 
+-	if (job_ptr->het_job_id && !job_ptr->het_job_list)
+-		return ESLURM_NOT_HET_JOB_LEADER;
++	if (job_ptr->het_job_id && !job_ptr->het_job_list) {
++		if (!het_job_batch_each(job_ptr))
++			return ESLURM_NOT_HET_JOB_LEADER;
++		/* --het-batch=each: requeue this component alone */
++		rc = _job_requeue_op(uid, job_ptr, preempt, flags);
++		if (rc == SLURM_SUCCESS)
++			_het_job_detach(job_ptr);
++		return rc;
++	}
+ 
+ 	if (job_ptr->het_job_list) {
+ 		foreach_requeue_hetjob_t requeue_hetjob = {
+@@ -18218,6 +18999,32 @@ static int _job_requeue(uid_t uid, job_record_t *job_ptr, bool preempt,
+ 			.rc = SLURM_SUCCESS,
+ 			.uid = uid,
+ 		};
++
++		/*
++		 * --het-batch=each: components end on their own, and some may
++		 * not be able to restart (--no-requeue). A hetjob requeued in
++		 * part would leave the requeued components pending as a gang
++		 * that can never start (backfill's _het_job_full() needs every
++		 * attached component running or pending), and every job
++		 * waiting to join it. So it is requeued only if every attached
++		 * component can be, ended ones included. "Incomplete"
++		 * (JOB_RUNNING) applies to the hetjob as a whole: while any
++		 * attached component runs, all of them are requeued.
++		 */
++		if (het_job_batch_each(job_ptr)) {
++			if ((flags & JOB_STATE_BASE) == JOB_RUNNING) {
++				if (!list_find_first(job_ptr->het_job_list,
++						     _foreach_het_comp_active,
++						     NULL))
++					return SLURM_SUCCESS;
++				requeue_hetjob.flags &= ~JOB_STATE_BASE;
++			}
++			(void) list_find_first(job_ptr->het_job_list,
++					       _foreach_hetjob_requeue_test,
++					       &requeue_hetjob);
++			if (requeue_hetjob.rc != SLURM_SUCCESS)
++				return requeue_hetjob.rc;
++		}
+ 		(void) list_for_each(job_ptr->het_job_list,
+ 				     _foreach_hetjob_requeue,
+ 				     &requeue_hetjob);
+@@ -18229,6 +19036,41 @@ static int _job_requeue(uid_t uid, job_record_t *job_ptr, bool preempt,
+ 	return rc;
+ }
+ 
++/*
++ * Requeue hetjob component <het_job_id>+<offset_str>. A component other than
++ * the leader of a --het-batch=each hetjob is requeued alone; the leader
++ * (offset 0) of such a hetjob can not be, since its record carries the
++ * hetjob. For other hetjobs this is the same as requeueing the leader ID.
++ */
++static int _job_requeue_het_comp(uid_t uid, uint32_t het_job_id,
++				 char *offset_str, bool preempt,
++				 uint32_t flags)
++{
++	char *end_ptr = NULL;
++	long int offset;
++	job_record_t *job_ptr;
++
++	offset = strtol(offset_str, &end_ptr, 10);
++	if ((end_ptr == offset_str) || (end_ptr[0] != '\0') ||
++	    (offset < 0) || (offset == LONG_MAX)) {
++		info("%s: invalid JobId=%u+%s", __func__, het_job_id,
++		     offset_str);
++		return ESLURM_INVALID_JOB_ID;
++	}
++	if (!(job_ptr = _find_het_comp(het_job_id, (uint32_t) offset)))
++		return ESLURM_INVALID_JOB_ID;
++	if (job_ptr->het_join_id)	/* detached, waiting to rejoin */
++		return ESLURM_JOB_PENDING;
++	if (!job_ptr->het_job_id)
++		return ESLURM_NOT_HET_JOB;
++	if (_het_job_is_leader(job_ptr) && het_job_batch_each(job_ptr))
++		return ESLURM_NOT_SUPPORTED;
++	if (!_het_job_is_leader(job_ptr) && !het_job_batch_each(job_ptr))
++		return ESLURM_NOT_HET_JOB_LEADER;
++
++	return _job_requeue(uid, job_ptr, preempt, flags);
++}
++
+ /*
+  * job_requeue - Requeue a running or pending batch job
+  * IN uid - user id of user issuing the RPC
+@@ -18288,7 +19130,8 @@ extern int job_requeue2(uid_t uid, requeue_msg_t *req_ptr, slurm_msg_t *msg,
+ 
+ 	long_id = strtol(job_id_str, &end_ptr, 10);
+ 	if ((long_id <= 0) || (long_id == LONG_MAX) ||
+-	    ((end_ptr[0] != '\0') && (end_ptr[0] != '_'))) {
++	    ((end_ptr[0] != '\0') && (end_ptr[0] != '_') &&
++	     (end_ptr[0] != '+'))) {
+ 		info("%s: invalid JobId=%s", __func__, job_id_str);
+ 		rc = ESLURM_INVALID_JOB_ID;
+ 		goto reply;
+@@ -18297,6 +19140,11 @@ extern int job_requeue2(uid_t uid, requeue_msg_t *req_ptr, slurm_msg_t *msg,
+ 		end_ptr += 2;	/* Defaults to full job array */
+ 
+ 	job_id = (uint32_t) long_id;
++	if (end_ptr[0] == '+') {	/* Hetjob component */
++		rc = _job_requeue_het_comp(uid, job_id, end_ptr + 1, preempt,
++					   flags);
++		goto reply;
++	}
+ 	if (end_ptr[0] == '\0') {	/* Single job (or full job array) */
+ 		job_record_t *job_ptr_done = NULL;
+ 		job_ptr = find_job_record(job_id);
+@@ -19117,6 +19965,18 @@ extern bool job_hold_requeue(job_record_t *job_ptr)
+ 	if (! (state & JOB_REQUEUE))
+ 		return false;
+ 
++	/*
++	 * --het-batch=each: the leader record carries the hetjob and can not
++	 * be requeued alone (see _het_job_detach()); its component just ends.
++	 */
++	if (het_job_batch_each(job_ptr) && _het_job_is_leader(job_ptr)) {
++		info("%s: %pJ leads a --het-batch=each hetjob and can not be requeued alone",
++		     __func__, job_ptr);
++		job_state_unset_flag(job_ptr, (JOB_REQUEUE | JOB_SPECIAL_EXIT |
++					       JOB_REQUEUE_HOLD));
++		return false;
++	}
++
+ 	/* Sent event requeue to the database.  */
+ 	if (!(job_ptr->bit_flags & TRES_STR_CALC) &&
+ 	    job_ptr->tres_alloc_cnt &&
+@@ -19166,6 +20026,8 @@ extern bool job_hold_requeue(job_record_t *job_ptr)
+ 	      __func__, job_ptr, job_ptr->job_state,
+ 	      job_ptr->state_reason, job_ptr->priority);
+ 
++	_het_job_detach(job_ptr);	/* --het-batch=each component */
++
+ 	return true;
+ }
+ 
+diff --git a/src/slurmctld/job_scheduler.c b/src/slurmctld/job_scheduler.c
+index babfd82..b187a60 100644
+--- a/src/slurmctld/job_scheduler.c
++++ b/src/slurmctld/job_scheduler.c
+@@ -200,7 +200,9 @@ typedef struct {
+ } valid_feature_t;
+ 
+ static batch_job_launch_msg_t *_build_launch_job_msg(job_record_t *job_ptr,
+-						     uint16_t protocol_version);
++						     uint16_t protocol_version,
++						     bool relaunch);
++static int	_launch_job(job_record_t *job_ptr, bool relaunch);
+ static bool	_job_runnable_test1(job_record_t *job_ptr, bool clear_start);
+ static bool	_job_runnable_test2(job_record_t *job_ptr, time_t now,
+ 				    bool check_min_time);
+@@ -2335,9 +2337,17 @@ static void _split_env(batch_job_launch_msg_t *launch_msg_ptr)
+ 	}
+ }
+ 
+-/* Given a scheduled job, return a pointer to it batch_job_launch_msg_t data */
++/*
++ * Given a scheduled job, return a pointer to it batch_job_launch_msg_t data.
++ * relaunch: the relaunch of a --het-batch=each component's batch script on a
++ *	new batch host (het_batch_relaunch()). A failure then only returns NULL:
++ *	no fatal(), no job_complete(), no hold for a credential failure. The
++ *	component is still running on its other nodes, and the caller ends it
++ *	NODE_FAIL.
++ */
+ static batch_job_launch_msg_t *_build_launch_job_msg(job_record_t *job_ptr,
+-						     uint16_t protocol_version)
++						     uint16_t protocol_version,
++						     bool relaunch)
+ {
+ 	char *fail_why = NULL;
+ 	batch_job_launch_msg_t *launch_msg_ptr;
+@@ -2377,9 +2387,14 @@ static batch_job_launch_msg_t *_build_launch_job_msg(job_record_t *job_ptr,
+ 	launch_msg_ptr->profile       = job_ptr->profile;
+ 
+ 	if (make_batch_job_cred(launch_msg_ptr, job_ptr, protocol_version)) {
++		slurm_free_job_launch_msg(launch_msg_ptr);
++		if (relaunch) {
++			error("%s: slurm_cred_create failure for %pJ, cannot relaunch its batch script",
++			      __func__, job_ptr);
++			return NULL;
++		}
+ 		error("%s: slurm_cred_create failure for %pJ, holding job",
+ 		      __func__, job_ptr);
+-		slurm_free_job_launch_msg(launch_msg_ptr);
+ 		job_mgr_handle_cred_failure(job_ptr);
+ 		return NULL;
+ 	}
+@@ -2452,8 +2467,21 @@ static batch_job_launch_msg_t *_build_launch_job_msg(job_record_t *job_ptr,
+ 	return launch_msg_ptr;
+ 
+ job_failed:
+-	/* fatal or kill the job as it can never be recovered */
+-	if (!ignore_state_errors)
++	if (relaunch) {
++		/* The leader too: no fatal(), the caller ends the component */
++		error("%s: %s for %pJ, cannot relaunch its batch script",
++		      __func__, fail_why, job_ptr);
++		slurm_free_job_launch_msg(launch_msg_ptr);
++		return NULL;
++	}
++	/*
++	 * fatal or kill the job as it can never be recovered.
++	 * --het-batch=each: stock Slurm never loads the script of a component
++	 * other than the leader, so a missing one is no reason to stop
++	 * slurmctld; that component ends and the hetjob runs on.
++	 */
++	if (!ignore_state_errors &&
++	    !(het_job_batch_each(job_ptr) && job_ptr->het_job_offset))
+ 		fatal("%s: %s for %pJ. Check file system serving StateSaveLocation as that directory may be missing or corrupted. Start with '-i' to ignore this error and kill the afflicted jobs.",
+ 		      __func__, fail_why, job_ptr);
+ 
+@@ -2510,6 +2538,12 @@ static job_record_t *_het_job_ready(job_record_t *job_ptr)
+ 
+ 	if (job_ptr->het_job_id == 0)	/* Not a hetjob */
+ 		return job_ptr;
++	/*
++	 * --het-batch=each: every component launches its own batch script
++	 * once its own nodes are ready, without waiting for the others.
++	 */
++	if (het_job_batch_each(job_ptr))
++		return job_ptr;
+ 	ready_struct.het_job_leader = find_job_record(job_ptr->het_job_id);
+ 	if (!ready_struct.het_job_leader) {
+ 		error("Hetjob leader %pJ not found", job_ptr);
+@@ -2796,10 +2830,123 @@ static void _set_het_job_env(job_record_t *het_job_leader,
+ }
+ 
+ /*
+- * launch_job - send an RPC to a slurmd to initiate a batch job
+- * IN job_ptr - pointer to job that will be initiated
++ * --het-batch=each: the batch script of each component runs with only that
++ * component's allocation in its environment (SLURM_JOB_ID, SLURM_JOB_NODELIST,
++ * ... of the component), like an ordinary batch job, so srun in the script
++ * creates steps in that component only. These variables tell the script which
++ * component it is. The SLURM_HET_SIZE and per-component *_HET_GROUP_<n>
++ * variables of _set_het_job_env() are not set: srun would then treat the
++ * allocation as the whole hetjob.
++ *
++ * SLURM_HET_BATCH_RESTART=<n> is set when the script is relaunched on a new
++ * batch host after the component lost its own (het_batch_relaunch()), n
++ * counting the relaunches of this component. It is removed otherwise: a job
++ * submitted from inside a relaunched script (a join, say) inherits the
++ * variable with the rest of the submitting environment.
+  */
+-extern void launch_job(job_record_t *job_ptr)
++static void _set_het_batch_each_env(job_record_t *job_ptr,
++				    batch_job_launch_msg_t *launch_msg_ptr)
++{
++	if (!launch_msg_ptr->environment) {
++		error("%pJ lacks environment", job_ptr);
++		return;
++	}
++	(void) env_array_overwrite_fmt(&launch_msg_ptr->environment,
++				       "SLURM_HET_JOB_ID", "%u",
++				       job_ptr->het_job_id);
++	(void) env_array_overwrite_fmt(&launch_msg_ptr->environment,
++				       "SLURM_HET_JOB_OFFSET", "%u",
++				       job_ptr->het_job_offset);
++	if (job_ptr->het_batch_restart)
++		(void) env_array_overwrite_fmt(&launch_msg_ptr->environment,
++					       "SLURM_HET_BATCH_RESTART", "%u",
++					       job_ptr->het_batch_restart);
++	else
++		unsetenvp(launch_msg_ptr->environment,
++			  "SLURM_HET_BATCH_RESTART");
++	launch_msg_ptr->envc = PTR_ARRAY_SIZE(launch_msg_ptr->environment) - 1;
++}
++
++/*
++ * het_batch_relaunch - --het-batch=each: run the batch script of a component
++ *	again, on a new batch host, after the component lost the node that ran
++ *	it and keeps running on its other nodes (--no-kill). The caller has
++ *	excised that node and completed the old batch step.
++ *
++ *	The new batch host is chosen exactly as at the first launch, by
++ *	pick_batch_host(): the first node (lowest node index) of the remaining
++ *	allocation or, if the component was submitted with --batch=<features>,
++ *	the first remaining node that has those features (the first remaining
++ *	node if none has them). The state of the node is not looked at: a node
++ *	that died together with the old batch host but is not marked DOWN yet
++ *	can be picked. Its launch then waits (agent.c:_batch_launch_defer()
++ *	while the node does not respond; a launch that gets no response does
++ *	not end the component, het_batch_launch_fail_ignore()), and once that
++ *	node is marked DOWN in turn the component loses it like any batch host
++ *	and the script is relaunched on the next node, or the component ends
++ *	NODE_FAIL when no node is left.
++ *
++ *	The script gets the component's current allocation (SLURM_JOB_NODELIST
++ *	...) and SLURM_HET_BATCH_RESTART=<n>, the number of relaunches.
++ * IN job_ptr - the component
++ * RET SLURM_SUCCESS once the launch is queued to the agent. Otherwise an
++ *	error code: nothing was launched and no batch step was created,
++ *	BatchHost and HetBatchRestart are unchanged, and the caller ends the
++ *	component NODE_FAIL.
++ */
++extern int het_batch_relaunch(job_record_t *job_ptr)
++{
++	char *old_host;
++	int rc;
++
++	xassert(het_job_batch_each(job_ptr));
++
++	if (!job_ptr->batch_flag || !IS_JOB_RUNNING(job_ptr) ||
++	    !job_ptr->node_cnt || !job_ptr->total_cpus) {
++		error("%s: %pJ cannot be relaunched (batch flag %u, state %s, %u nodes, %u CPUs)",
++		      __func__, job_ptr, job_ptr->batch_flag,
++		      job_state_string(job_ptr->job_state), job_ptr->node_cnt,
++		      job_ptr->total_cpus);
++		return SLURM_ERROR;
++	}
++
++	old_host = job_ptr->batch_host;
++	job_ptr->batch_host = NULL;
++	if (pick_batch_host(job_ptr) != SLURM_SUCCESS) {
++		xfree(job_ptr->batch_host);
++		job_ptr->batch_host = old_host;
++		return SLURM_ERROR;
++	}
++	job_ptr->het_batch_restart++;
++	info("%s: %pJ lost its batch host %s, relaunching its batch script on %s (restart %u, NodeList=%s)",
++	     __func__, job_ptr, old_host, job_ptr->batch_host,
++	     job_ptr->het_batch_restart, job_ptr->nodes);
++	if ((rc = _launch_job(job_ptr, true)) != SLURM_SUCCESS) {
++		error("%s: relaunch %u of the batch script of %pJ on %s failed",
++		      __func__, job_ptr->het_batch_restart, job_ptr,
++		      job_ptr->batch_host);
++		job_ptr->het_batch_restart--;
++		xfree(job_ptr->batch_host);
++		job_ptr->batch_host = old_host;
++		return rc;
++	}
++	xfree(old_host);
++	job_ptr->time_last_active = time(NULL);
++	last_job_update = time(NULL);
++	return SLURM_SUCCESS;
++}
++
++/*
++ * _launch_job - see launch_job()
++ * IN relaunch - relaunch the batch script of a --het-batch=each component on
++ *	the new batch host het_batch_relaunch() picked
++ * RET SLURM_SUCCESS if the launch was queued to the agent, otherwise an error
++ *	code. A relaunch that fails changes nothing: the new batch step is
++ *	only built once the launch message is, and the failure neither stops
++ *	slurmctld nor ends, requeues or holds the component
++ *	(_build_launch_job_msg()).
++ */
++static int _launch_job(job_record_t *job_ptr, bool relaunch)
+ {
+ 	batch_job_launch_msg_t *launch_msg_ptr;
+ 	uint16_t protocol_version = NO_VAL16;
+@@ -2810,26 +2957,51 @@ extern void launch_job(job_record_t *job_ptr)
+ 	xassert(job_ptr);
+ 	xassert(job_ptr->batch_flag);
+ 
+-	if (job_ptr->total_cpus == 0)
+-		return;
++	if (job_ptr->total_cpus == 0) {
++		if (relaunch)
++			error("%s: %pJ has no CPUs left", __func__, job_ptr);
++		return SLURM_ERROR;
++	}
+ 
+ 	launch_job_ptr = _het_job_ready(job_ptr);
+-	if (!launch_job_ptr)
+-		return;
++	if (!launch_job_ptr) {
++		if (relaunch)
++			error("%s: %pJ is not ready to launch", __func__,
++			      job_ptr);
++		return SLURM_ERROR;
++	}
++	/* _het_job_ready() returns a --het-batch=each component itself */
++	xassert(!relaunch || (launch_job_ptr == job_ptr));
+ 
+ 	if (pick_batch_host(launch_job_ptr) != SLURM_SUCCESS)
+-		return;
++		return SLURM_ERROR;
+ 
+ 	node_ptr = find_node_record(job_ptr->batch_host);
+ 	if (node_ptr)
+ 		protocol_version = node_ptr->protocol_version;
+ 
+-	(void)build_batch_step(job_ptr);
++	if (!relaunch)
++		(void)build_batch_step(job_ptr);
+ 
+-	launch_msg_ptr = _build_launch_job_msg(launch_job_ptr,protocol_version);
++	launch_msg_ptr = _build_launch_job_msg(launch_job_ptr, protocol_version,
++					       relaunch);
+ 	if (launch_msg_ptr == NULL)
+-		return;
+-	if (launch_job_ptr->het_job_id)
++		return SLURM_ERROR;
++	if (relaunch && !build_batch_step(job_ptr)) {
++		error("%s: cannot create the batch step of %pJ", __func__,
++		      job_ptr);
++		slurm_free_job_launch_msg(launch_msg_ptr);
++		return SLURM_ERROR;
++	}
++	if (het_job_batch_each(launch_job_ptr)) {
++		_set_het_batch_each_env(launch_job_ptr, launch_msg_ptr);
++		/*
++		 * slurmd reports a failed batch launch against het_job_id when
++		 * it is set (req.c:_launch_job_fail()); this launch belongs to
++		 * the component, so report it against the component's job ID.
++		 */
++		launch_msg_ptr->het_job_id = 0;
++	} else if (launch_job_ptr->het_job_id)
+ 		_set_het_job_env(launch_job_ptr, launch_msg_ptr);
+ 
+ 	_set_job_env(launch_job_ptr, launch_msg_ptr);
+@@ -2846,6 +3018,16 @@ extern void launch_job(job_record_t *job_ptr)
+ 
+ 	/* Launch the RPC via agent */
+ 	agent_queue_request(agent_arg_ptr);
++	return SLURM_SUCCESS;
++}
++
++/*
++ * launch_job - send an RPC to a slurmd to initiate a batch job
++ * IN job_ptr - pointer to job that will be initiated
++ */
++extern void launch_job(job_record_t *job_ptr)
++{
++	(void) _launch_job(job_ptr, false);
+ }
+ 
+ /*
+diff --git a/src/slurmctld/job_scheduler.h b/src/slurmctld/job_scheduler.h
+index 3a1a887..bc412c7 100644
+--- a/src/slurmctld/job_scheduler.h
++++ b/src/slurmctld/job_scheduler.h
+@@ -173,6 +173,15 @@ extern int job_start_data(job_record_t *job_ptr,
+  */
+ extern void launch_job(job_record_t *job_ptr);
+ 
++/*
++ * het_batch_relaunch - --het-batch=each: relaunch a component's batch script
++ *	on a new batch host, picked by pick_batch_host(), after it lost its own
++ *	(see job_scheduler.c)
++ * RET SLURM_SUCCESS once the launch is queued; otherwise nothing changed and
++ *	the caller must end the component
++ */
++extern int het_batch_relaunch(job_record_t *job_ptr);
++
+ /*
+  * make_batch_job_cred - add a job credential to the batch_job_launch_msg
+  * IN/OUT launch_msg_ptr - batch_job_launch_msg in which job_id, step_id,
+diff --git a/src/slurmctld/node_mgr.c b/src/slurmctld/node_mgr.c
+index 81c82d2..760318b 100644
+--- a/src/slurmctld/node_mgr.c
++++ b/src/slurmctld/node_mgr.c
+@@ -225,17 +225,18 @@ int dump_all_node_state ( void )
+ 	START_TIMER;
+ 	/* write header: version, time */
+ 	packstr(NODE_STATE_VERSION, buffer);
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time (NULL), buffer);
+ 
+ 	/* write node records to buffer */
+ 	lock_slurmctld (node_read_lock);
+ 	_dump_cluster_settings(buffer);
+-	sackd_mgr_dump_state(buffer, SLURM_PROTOCOL_VERSION);
++	sackd_mgr_dump_state(buffer, SLURM_STOCK_STATE_PROTOCOL_VERSION);
+ 	for (inx = 0; (node_ptr = next_node(&inx)); inx++) {
+ 		xassert (node_ptr->magic == NODE_MAGIC);
+ 		xassert (node_ptr->config_ptr->magic == CONFIG_MAGIC);
+-		node_record_pack_state(node_ptr, SLURM_PROTOCOL_VERSION,
++		node_record_pack_state(node_ptr,
++				       SLURM_STOCK_STATE_PROTOCOL_VERSION,
+ 				       buffer);
+ 	}
+ 	unlock_slurmctld (node_read_lock);
+diff --git a/src/slurmctld/node_scheduler.c b/src/slurmctld/node_scheduler.c
+index 32b018f..fbc4640 100644
+--- a/src/slurmctld/node_scheduler.c
++++ b/src/slurmctld/node_scheduler.c
+@@ -3173,6 +3173,24 @@ extern int select_nodes(job_node_select_t *job_node_select,
+ 		return ESLURM_JOB_HELD;
+ 	}
+ 
++	/*
++	 * A job that (re)joins a hetjob starts only while the hetjob runs.
++	 * job_independent() holds it back when building the job queue; this
++	 * catches a hetjob that changed since (e.g. while backfill yielded its
++	 * locks). ESLURM_NODE_NOT_AVAIL leaves the job pending without a hold
++	 * in both _schedule() and backfill; job_independent() cancels it on
++	 * the next pass if the hetjob has ended.
++	 */
++	if (job_ptr->het_join_id &&
++	    (het_job_join_test(job_ptr) != SLURM_SUCCESS)) {
++		job_ptr->state_reason = WAIT_DEPENDENCY;
++		xfree(job_ptr->state_desc);
++		xstrfmtcat(job_ptr->state_desc,
++			   "waiting for hetjob %u to start",
++			   job_ptr->het_join_id);
++		return ESLURM_NODE_NOT_AVAIL;
++	}
++
+ 	bb = bb_g_job_test_stage_in(job_ptr, test_only);
+ 	if (bb != 1) {
+ 		if ((bb == -1) &&
+@@ -3598,6 +3616,15 @@ extern int select_nodes(job_node_select_t *job_node_select,
+ 		}
+ 	}
+ 
++	/*
++	 * The job was scheduled alone, as an ordinary job. Now that it runs,
++	 * make it a component of its hetjob, before its start is recorded in
++	 * accounting (jobacct_storage_g_job_start() below) and before the
++	 * caller launches its batch script (launch_job()).
++	 */
++	if (job_ptr->het_join_id)
++		het_job_attach(job_ptr);
++
+ 	allocate_nodes(job_ptr);
+ 	job_array_start(job_ptr);
+ 	build_node_details(job_ptr, true);
+@@ -3838,7 +3865,16 @@ extern void launch_prolog(job_record_t *job_ptr)
+ 		 gres_g_prep_build_env(job_ptr->gres_list_alloc,
+ 				       job_ptr->nodes);
+ 	prolog_msg_ptr->job_id = job_ptr->job_id;
+-	prolog_msg_ptr->het_job_id = job_ptr->het_job_id;
++	/*
++	 * slurmd reports prolog completion and failure against het_job_id
++	 * when it is set. A --het-batch=each component starts and launches
++	 * its batch script on its own (PrologFlags=DeferBatch waits for its
++	 * own WAIT_PROLOG), so it must hear about its own prolog.
++	 */
++	if (het_job_batch_each(job_ptr))
++		prolog_msg_ptr->het_job_id = 0;
++	else
++		prolog_msg_ptr->het_job_id = job_ptr->het_job_id;
+ 	prolog_msg_ptr->uid = job_ptr->user_id;
+ 	prolog_msg_ptr->gid = job_ptr->group_id;
+ 	if (!job_ptr->user_name)
+diff --git a/src/slurmctld/partition_mgr.c b/src/slurmctld/partition_mgr.c
+index 87f991a..93acfb7 100644
+--- a/src/slurmctld/partition_mgr.c
++++ b/src/slurmctld/partition_mgr.c
+@@ -370,7 +370,7 @@ int dump_all_part_state(void)
+ 	START_TIMER;
+ 	/* write header: time */
+ 	packstr(PART_STATE_VERSION, buffer);
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	/* write partition records to buffer */
+@@ -406,7 +406,7 @@ static int _dump_part_state(void *x, void *arg)
+ 	else
+ 		part_ptr->flags &= (~PART_FLAG_DEFAULT);
+ 
+-	part_record_pack(part_ptr, buffer, SLURM_PROTOCOL_VERSION);
++	part_record_pack(part_ptr, buffer, SLURM_STOCK_STATE_PROTOCOL_VERSION);
+ 
+ 	return 0;
+ }
+diff --git a/src/slurmctld/prep_slurmctld.c b/src/slurmctld/prep_slurmctld.c
+index e2e9d51..fa6d280 100644
+--- a/src/slurmctld/prep_slurmctld.c
++++ b/src/slurmctld/prep_slurmctld.c
+@@ -87,22 +87,27 @@ extern void prep_prolog_slurmctld_callback(int rc, uint32_t job_id,
+ 	/* all async prologs have completed, continue on now */
+ 	if (job_ptr->prep_prolog_failed) {
+ 		uint32_t jid = job_id;
++		/* --het-batch=each: the failure affects this component only */
++		bool het_each = het_job_batch_each(job_ptr);
+ 
+ 		job_ptr->prep_prolog_failed = false;
+ 
+ 		/* requeue het leader if het job */
+-		if (job_ptr->het_job_id)
++		if (job_ptr->het_job_id && !het_each)
+ 			jid = job_ptr->het_job_id;
+ 
+-		if ((rc = job_requeue(0, jid, NULL, false, 0)) &&
+-		    (rc != ESLURM_JOB_PENDING)) {
++		if (het_each && (job_ptr->het_job_id == job_ptr->job_id))
++			rc = ESLURM_NOT_SUPPORTED; /* leader: not alone */
++		else
++			rc = job_requeue(0, jid, NULL, false, 0);
++		if (rc && (rc != ESLURM_JOB_PENDING)) {
+ 			info("unable to requeue JobId=%u: %s", jid,
+ 			     slurm_strerror(rc));
+ 
+ 			srun_user_message(job_ptr,
+ 					  "PrologSlurmctld failed, job killed");
+ 
+-			if (job_ptr->het_job_id) {
++			if (job_ptr->het_job_id && !het_each) {
+ 				job_record_t *het_leader = job_ptr;
+ 
+ 				if (!het_leader->het_job_list) {
+diff --git a/src/slurmctld/proc_req.c b/src/slurmctld/proc_req.c
+index cbe9311..55518c4 100644
+--- a/src/slurmctld/proc_req.c
++++ b/src/slurmctld/proc_req.c
+@@ -2860,7 +2860,8 @@ static void _slurm_rpc_het_job_alloc_info(slurm_msg_t *msg)
+ 
+ 	/* return result */
+ 	if ((error_code == SLURM_SUCCESS) && job_ptr &&
+-	    (job_ptr->het_job_id && !job_ptr->het_job_list))
++	    (job_ptr->het_job_id && !job_ptr->het_job_list) &&
++	    !het_job_batch_each(job_ptr))
+ 		error_code = ESLURM_NOT_HET_JOB_LEADER;
+ 	if (error_code || (job_ptr == NULL) || (job_ptr->job_resrcs == NULL)) {
+ 		if (!(msg->flags & CTLD_QUEUE_PROCESSING))
+@@ -2875,7 +2876,11 @@ static void _slurm_rpc_het_job_alloc_info(slurm_msg_t *msg)
+ 	debug2("%s: JobId=%u NodeList=%s %s", __func__,
+ 	       job_info_msg->job_id, job_ptr->nodes, TIME_STR);
+ 
+-	if (!job_ptr->het_job_list) {
++	/*
++	 * --het-batch=each: each component is its own allocation for steps
++	 * (srun in a component's batch script runs in that component only).
++	 */
++	if (!job_ptr->het_job_list || het_job_batch_each(job_ptr)) {
+ 		resp = list_create(_het_job_alloc_list_del);
+ 		job_info_resp_msg = build_job_info_resp(job_ptr);
+ 		set_remote_working_response(job_info_resp_msg, job_ptr,
+@@ -3694,6 +3699,7 @@ static void _slurm_rpc_submit_batch_het_job(slurm_msg_t *msg)
+ 	hostset_t *jobid_hostset = NULL;
+ 	char tmp_str[32];
+ 	char *het_job_id_set = NULL;
++	bool het_batch_each;
+ 
+ 	START_TIMER;
+ 	if (!job_req_list || (list_count(job_req_list) == 0)) {
+@@ -3814,6 +3820,16 @@ static void _slurm_rpc_submit_batch_het_job(slurm_msg_t *msg)
+ 		err_msg = NULL;
+ 	}
+ 
++	/*
++	 * --het-batch is a property of the whole hetjob, taken from the
++	 * leader's request. It is set on every component's request so that
++	 * _job_create() checks each component (one left without a script of
++	 * its own, e.g. with a burst buffer, is rejected) and copies it into
++	 * every record.
++	 */
++	job_desc_msg = list_peek(job_req_list);
++	het_batch_each = (job_desc_msg->bitflags & HETJOB_BATCH_EACH);
++
+ 	/* Create new job allocations */
+ 	submit_job_list = list_create(NULL);
+ 	het_job_offset = 0;
+@@ -3824,6 +3840,10 @@ static void _slurm_rpc_submit_batch_het_job(slurm_msg_t *msg)
+ 	while ((job_desc_msg = list_next(iter))) {
+ 		if (!script)
+ 			script = xstrdup(job_desc_msg->script);
++		if (het_batch_each)
++			job_desc_msg->bitflags |= HETJOB_BATCH_EACH;
++		else
++			job_desc_msg->bitflags &= ~HETJOB_BATCH_EACH;
+ 		if (het_job_offset && job_desc_msg->script) {
+ 			info("%s: Hetjob %u offset %u has script, being ignored",
+ 			     __func__, het_job_id, het_job_offset);
+diff --git a/src/slurmctld/read_config.c b/src/slurmctld/read_config.c
+index 12b23df..b01a805 100644
+--- a/src/slurmctld/read_config.c
++++ b/src/slurmctld/read_config.c
+@@ -1013,12 +1013,14 @@ static int _foreach_requeue_job_node_failed(void *x, void *arg)
+ 	 * it may be found here long after. Requeueing its leader would requeue
+ 	 * every component. With SchedulerParameters=het_component_node_fail
+ 	 * that is a component other than the leader that ended with NODE_FAIL
+-	 * while its leader did not. Records that _sync_jobs_to_conf() marked
++	 * while its leader did not; with --het-batch=each it is any component,
++	 * the leader included. Records that _sync_jobs_to_conf() marked
+ 	 * JOB_REQUEUE during this startup keep the stock handling.
+ 	 */
+ 	if (!IS_JOB_REQUEUED(job_ptr) && het_job_leader &&
+-	    (het_job_leader != job_ptr) && het_comp_node_fail &&
+-	    !IS_JOB_NODE_FAILED(het_job_leader))
++	    (het_job_batch_each(job_ptr) ||
++	     ((het_job_leader != job_ptr) && het_comp_node_fail &&
++	      !IS_JOB_NODE_FAILED(het_job_leader))))
+ 		return SLURM_SUCCESS;
+ 
+ 	if (het_job_leader && het_job_leader->batch_flag &&
+@@ -2449,7 +2451,7 @@ extern int dump_config_state_lite(void)
+ 
+ 	START_TIMER;
+ 	/* write header: version, time */
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 	packstr(slurm_conf.accounting_storage_type, buffer);
+ 
+diff --git a/src/slurmctld/reservation.c b/src/slurmctld/reservation.c
+index f4513e6..0d40eb8 100644
+--- a/src/slurmctld/reservation.c
++++ b/src/slurmctld/reservation.c
+@@ -4234,7 +4234,7 @@ extern int dump_all_resv_state(void)
+ 
+ 	/* write header: time */
+ 	packstr(RESV_STATE_VERSION, buffer);
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 	pack32(top_suffix, buffer);
+ 
+@@ -4242,7 +4242,8 @@ extern int dump_all_resv_state(void)
+ 	lock_slurmctld(resv_read_lock);
+ 	iter = list_iterator_create(resv_list);
+ 	while ((resv_ptr = list_next(iter)))
+-		_pack_resv(resv_ptr, buffer, true, SLURM_PROTOCOL_VERSION);
++		_pack_resv(resv_ptr, buffer, true,
++			   SLURM_STOCK_STATE_PROTOCOL_VERSION);
+ 	list_iterator_destroy(iter);
+ 	unlock_slurmctld(resv_read_lock);
+ 
+diff --git a/src/slurmctld/sackd_mgr.c b/src/slurmctld/sackd_mgr.c
+index e13f046..6d5e867 100644
+--- a/src/slurmctld/sackd_mgr.c
++++ b/src/slurmctld/sackd_mgr.c
+@@ -77,7 +77,9 @@ static void _pack_node(void *x, uint16_t protocol_version, buf_t *buffer)
+ {
+ 	sackd_node_t *node = x;
+ 
+-	xassert(protocol_version == SLURM_PROTOCOL_VERSION);
++	/* HETFT: node_state is written at SLURM_STOCK_STATE_PROTOCOL_VERSION */
++	xassert((protocol_version == SLURM_PROTOCOL_VERSION) ||
++		(protocol_version == SLURM_STOCK_STATE_PROTOCOL_VERSION));
+ 
+ 	pack16(node->protocol_version, buffer);
+ 	pack64(node->last_update, buffer);
+diff --git a/src/slurmctld/slurmctld.h b/src/slurmctld/slurmctld.h
+index 2fa81a2..b29e9f0 100644
+--- a/src/slurmctld/slurmctld.h
++++ b/src/slurmctld/slurmctld.h
+@@ -729,6 +729,79 @@ extern job_record_t *find_job_array_rec(uint32_t array_job_id,
+  */
+ extern job_record_t *find_het_job_record(uint32_t job_id, uint32_t het_job_id);
+ 
++/*
++ * het_job_batch_each - true if job_ptr is a component (or the leader) of a
++ *	hetjob submitted with sbatch --het-batch=each: every component runs
++ *	its own batch script and ends on its own.
++ */
++extern bool het_job_batch_each(job_record_t *job_ptr);
++
++/*
++ * het_batch_launch_superseded - --het-batch=each: true if a batch launch of
++ *	the component job_ptr, built with the job's restart count restart_cnt
++ *	(batch_job_launch_msg_t.restart_cnt) and sent to node_name, is no
++ *	longer the component's current launch:
++ *	- restart_cnt differs: the component was requeued since (it is
++ *	  pending, detached, or running again);
++ *	- node_name is no longer the component's batch host: the component
++ *	  lost that node and its script was relaunched on another one
++ *	  (het_batch_relaunch()). A node excised from an allocation never
++ *	  returns to it, so within one run of the component the batch host
++ *	  names one launch.
++ *	Such a launch must not be sent any more, and its failure says nothing
++ *	about the component as it is now. node_name NULL: only the restart
++ *	count is compared. False for any job that is not such a component.
++ */
++extern bool het_batch_launch_superseded(job_record_t *job_ptr,
++					const char *node_name,
++					uint16_t restart_cnt);
++
++/*
++ * het_batch_launch_fail_ignore - --het-batch=each: true if agent.c must not
++ *	end or requeue job_id (job_complete()) for the failure of a batch
++ *	launch built with restart count restart_cnt and sent to node_name
++ *	(NULL if not known), because:
++ *	- the launch is superseded (het_batch_launch_superseded()): say the
++ *	  component's first launch, still in flight when its batch host was
++ *	  marked DOWN and the script was relaunched elsewhere, or a launch
++ *	  sent before the component was requeued;
++ *	- or no_resp (the node did not respond) and the component's script
++ *	  was relaunched since its first launch (HetBatchRestart > 0): the
++ *	  component keeps running, and once its batch host is marked DOWN the
++ *	  script is relaunched on the next node, or the component ends
++ *	  NODE_FAIL if none is left (kill_running_job_by_node_ptr()).
++ *	A failure of the component's current first launch keeps the stock
++ *	handling. Logs why it ignores a failure. Needs the job write lock.
++ */
++extern bool het_batch_launch_fail_ignore(uint32_t job_id,
++					 const char *node_name,
++					 uint16_t restart_cnt, bool no_resp);
++
++/*
++ * het_batch_launch_pending - --het-batch=each: the agent still holds a batch
++ *	launch of the component job_ptr (agent.c:_batch_launch_defer()), so its
++ *	batch script is not missing yet: refresh its batch step's
++ *	time_last_active, which _purge_missing_jobs() checks for these
++ *	components. Needs the job write lock.
++ */
++extern void het_batch_launch_pending(job_record_t *job_ptr);
++
++/*
++ * het_job_join_test - test whether a pending job with het_join_id set can
++ *	start now and be attached to its hetjob
++ * RET SLURM_SUCCESS if it can start, ESLURM_JOB_PENDING if the hetjob is
++ *	being (re)started as a whole, ESLURM_INVALID_JOB_ID if the hetjob has
++ *	ended or is gone
++ */
++extern int het_job_join_test(job_record_t *job_ptr);
++
++/*
++ * het_job_attach - attach a pending job with het_join_id set to its hetjob
++ *	as component het_join_offset. Called by select_nodes() when the job
++ *	starts, before its start is recorded in accounting.
++ */
++extern void het_job_attach(job_record_t *job_ptr);
++
+ /*
+  * find_job_record - return a pointer to the job record with the given job_id
+  * IN job_id - requested job's id
+diff --git a/src/slurmctld/trigger_mgr.c b/src/slurmctld/trigger_mgr.c
+index 0a78b6f..6983db2 100644
+--- a/src/slurmctld/trigger_mgr.c
++++ b/src/slurmctld/trigger_mgr.c
+@@ -792,7 +792,7 @@ extern int trigger_state_save(void)
+ 
+ 	/* write header: version, time */
+ 	packstr(TRIGGER_STATE_VERSION, buffer);
+-	pack16(SLURM_PROTOCOL_VERSION, buffer);
++	pack16(SLURM_STOCK_STATE_PROTOCOL_VERSION, buffer);
+ 	pack_time(time(NULL), buffer);
+ 
+ 	/* write individual trigger records */
+diff --git a/src/stepmgr/stepmgr.c b/src/stepmgr/stepmgr.c
+index 95fbc40..354984b 100644
+--- a/src/stepmgr/stepmgr.c
++++ b/src/stepmgr/stepmgr.c
+@@ -4617,7 +4617,12 @@ extern step_record_t *build_batch_step(job_record_t *job_ptr_in)
+ 	step_record_t *step_ptr;
+ 	char *host = NULL;
+ 
+-	if (job_ptr_in->het_job_id) {
++	/*
++	 * The batch step of a hetjob lives on the leader, which runs the only
++	 * batch script; with --het-batch=each every component has its own.
++	 */
++	if (job_ptr_in->het_job_id &&
++	    !(job_ptr_in->bit_flags & HETJOB_BATCH_EACH)) {
+ 		job_ptr = stepmgr_ops->find_job_record(job_ptr_in->het_job_id);
+ 		if (!job_ptr) {
+ 			error("%s: hetjob leader is corrupt! This should never happen",
+@@ -4643,7 +4648,11 @@ extern step_record_t *build_batch_step(job_record_t *job_ptr_in)
+ 		host, NULL, NULL, 1, 1, SLURM_PROTOCOL_VERSION);
+ 	step_ptr->name = xstrdup("batch");
+ 	step_ptr->state = JOB_RUNNING;
+-	step_ptr->start_time = job_ptr->start_time;
++	/* --het-batch=each: relaunched on a new batch host */
++	if (job_ptr->het_batch_restart)
++		step_ptr->start_time = time(NULL);
++	else
++		step_ptr->start_time = job_ptr->start_time;
+ 	step_ptr->step_id.job_id = job_ptr->job_id;
+ 	step_ptr->step_id.step_id = SLURM_BATCH_SCRIPT;
+ 	step_ptr->step_id.step_het_comp = NO_VAL;

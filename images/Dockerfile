@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # SPDX-PackageName: slurm-containers
 ARG PARENT_IMAGE=ubuntu:22.04
-ARG CONTROLLER_RUNTIME_IMAGE=876143322689.dkr.ecr.us-east-1.amazonaws.com/slurm-controller@sha256:b1ac993c70ca45cf2ac914114006945f407581b0a32899b121ff55165828d93f
+ARG CONTROLLER_RUNTIME_IMAGE=876143322689.dkr.ecr.us-east-1.amazonaws.com/slurm-controller@sha256:d6bb3a9317141508f7ae2b720e9e8ac4f76f6c5c19853dd52173b3f9b36d1be3
+ARG ACCOUNTING_RUNTIME_IMAGE=ghcr.io/coreweave/slurm-containers/controller@sha256:1bb3857d0f47b9207dca9b53847fd66c37e85ea1c2c45378c886365bd8be3cac
+ARG LOGIN_RUNTIME_IMAGE=ghcr.io/coreweave/slurm-containers/controller-extras@sha256:c8cda863222ab98ca37b13972818f72c79c20636cd50a1ef961b5f6f4896bcea
+ARG COMPUTE_RUNTIME_IMAGE=ghcr.io/coreweave/slurm-containers/slurmd-cw-cu129-extras@sha256:15c3102d270eecbb00d2940d0ee2daa84ab6b2f313bebed937aba8b9a72249e9
 # Slurm version can be release version (ex. 22.05.7) or full git commit sha
 ARG SLURM_VERSION=25.05.3
 ARG S6_OVERLAY_VERSION=3.2.1.0
@@ -28,6 +31,10 @@ ARG NSSCACHE_FILES_DIR="/etc/nsscache"
 ARG CONDA_VERSION=py313_25.7.0-2
 ARG MICROMAMBA_VERSION=2.3.2-0
 ARG NHC_VERSION=1.4.3
+
+# Use the exact compute runtime's CUDA headers/stubs only while compiling.
+# The driver library is provided by the GPU host, never by this build stub.
+FROM $COMPUTE_RUNTIME_IMAGE AS nvml-build-input
 
 FROM $PARENT_IMAGE AS builder
 
@@ -128,6 +135,8 @@ RUN make
 RUN make install
 
 FROM builder AS slurm-builder
+COPY --from=nvml-build-input /usr/local/cuda-12.9/targets/x86_64-linux/include/nvml.h /opt/nvml/include/nvml.h
+COPY --from=nvml-build-input /usr/local/cuda-12.9/targets/x86_64-linux/lib/stubs/libnvidia-ml.so /opt/nvml/lib64/stubs/libnvidia-ml.so
 # Slum version can be release version (ex. 22.05.7) or full git commit sha
 ARG SLURM_VERSION
 WORKDIR /build
@@ -151,7 +160,7 @@ WORKDIR /build/slurm-$SLURM_VERSION
 RUN arch=$(uname -m) && \
   ./configure --prefix=/usr --libdir=/usr/lib/${arch}-linux-gnu --sysconfdir=/etc/slurm \
   --enable-pam --with-pam_dir=/usr/lib/${arch}-linux-gnu/security \
-  --with-hdf5 --disable-glibtest --disable-gtktest \
+  --with-hdf5 --disable-glibtest --disable-gtktest --with-nvml=/opt/nvml \
   --with-pmix=/usr/lib/${arch}-linux-gnu/$SLURM_PMIX_VERSION \
   --with-json=yes --with-yaml=yes --with-http-parser=yes --with-jwt=/usr/local/ --with-bpf=yes
 COPY build/Makefile.docs doc/Makefile
@@ -570,6 +579,29 @@ RUN echo "/usr/share/sunk/bin/reboot.sh" > /usr/sbin/reboot && \
   chmod +x /usr/sbin/reboot
 
 FROM $CONTROLLER_RUNTIME_IMAGE AS controller-rebuilt-slurm
+ARG SLURM_VERSION
+ARG PYXIS_VERSION
+COPY --from=slurm-builder /build/slurm-$SLURM_VERSION/INSTALLDIR/ /
+COPY --from=pyxis-builder /build/pyxis-${PYXIS_VERSION}/INSTALLDIR/ /
+RUN ldconfig
+
+# Preserve each deployed CW2 runtime, including CUDA/NCCL/Enroot and extras.
+# All roles receive the same complete Slurm build and ABI-compatible Pyxis.
+FROM $ACCOUNTING_RUNTIME_IMAGE AS accounting-rebuilt-slurm
+ARG SLURM_VERSION
+ARG PYXIS_VERSION
+COPY --from=slurm-builder /build/slurm-$SLURM_VERSION/INSTALLDIR/ /
+COPY --from=pyxis-builder /build/pyxis-${PYXIS_VERSION}/INSTALLDIR/ /
+RUN ldconfig
+
+FROM $LOGIN_RUNTIME_IMAGE AS login-rebuilt-slurm
+ARG SLURM_VERSION
+ARG PYXIS_VERSION
+COPY --from=slurm-builder /build/slurm-$SLURM_VERSION/INSTALLDIR/ /
+COPY --from=pyxis-builder /build/pyxis-${PYXIS_VERSION}/INSTALLDIR/ /
+RUN ldconfig
+
+FROM $COMPUTE_RUNTIME_IMAGE AS compute-rebuilt-slurm
 ARG SLURM_VERSION
 ARG PYXIS_VERSION
 COPY --from=slurm-builder /build/slurm-$SLURM_VERSION/INSTALLDIR/ /
