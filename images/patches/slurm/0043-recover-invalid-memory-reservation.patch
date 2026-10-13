@@ -1,0 +1,22 @@
+--- a/src/slurmctld/node_mgr.c
++++ b/src/slurmctld/node_mgr.c
+@@ -362,6 +362,19 @@
+ 			goto unpack_error;
+ 		}
+ 
++		/* SlurmdSpecOverride can underflow when its cgroup limit exceeds
++		 * RealMemory. Repair dynamic records before rebuilding their config;
++		 * retain node identity and job allocations during controller recovery.
++		 */
++		if ((node_state_rec->node_state & NODE_STATE_DYNAMIC_NORM) &&
++		    (node_state_rec->mem_spec_limit > node_state_rec->real_memory)) {
++			error("Node %s: clearing invalid saved MemSpecLimit=%"PRIu64
++			      " (RealMemory=%"PRIu64")",
++			      node_state_rec->name, node_state_rec->mem_spec_limit,
++			      node_state_rec->real_memory);
++			node_state_rec->mem_spec_limit = 0;
++		}
++
+ 		node_state = node_state_rec->node_state;
+ 		base_state = node_state & NODE_STATE_BASE;
+ 
